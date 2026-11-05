@@ -299,6 +299,16 @@ async def probe_duration(url, headers=None):
 DIRECT_STREAM_RE = re.compile(r"^https?://[^\s]+\.(?:m3u8|mp4|webm|mkv|mov|flv|ts)(?:\?|$)", re.I)
 
 
+# YouTube sering menolak satu client saja ("Requested format is not available").
+# Dicoba berurutan; yang terakhir memakai cookies (kalau cookies.txt ada).
+YT_ATTEMPTS = [
+    (False, {"player_client": ["android_vr"]}),
+    (False, {"player_client": ["web_embedded"]}),
+    (False, {"player_client": ["tv"]}),
+    (True, None),
+]
+
+
 def detect_source(url):
     low = (url or "").lower()
     if "youtube.com" in low or "youtu.be" in low:
@@ -312,7 +322,7 @@ def detect_source(url):
     return "Web"
 
 
-def _opts(use_cookies, video=False):
+def _opts(use_cookies, video=False, yt_args=None):
     h = VIDEO_HEIGHT or 480
     if video:
         # satu file yang sudah berisi video+suara (ffmpeg hanya menerima 1 URL)
@@ -328,7 +338,10 @@ def _opts(use_cookies, video=False):
         "geo_bypass": True,
         "js_runtimes": {"node": {}},
         "remote_components": ["ejs:github"],
+        "extractor_args": {"generic": {"impersonate": [""]}},
     }
+    if yt_args:
+        opts["extractor_args"]["youtube"] = yt_args
     if use_cookies and os.path.exists(COOKIES):
         opts["cookiefile"] = COOKIES
     return opts
@@ -426,15 +439,19 @@ def extract_stream(page_url, video=False):
     if label == "Direct" or DIRECT_STREAM_RE.match(page_url):
         return {"url": page_url, "page": page_url, "title": "Direct Stream", "duration": 0,
                 "source": "Direct", "video": video}, None
-    try:
-        with yt_dlp.YoutubeDL(_opts(label == "YouTube", video)) as ydl:
-            info = ydl.extract_info(page_url, download=False)
-        if info.get("entries"):
-            info = info["entries"][0]
-        return _song_from_info(info, label, video), None
-    except Exception as e:
-        print(f"Error resolve [{label}]: {e}")
-        return None, str(e)[:200]
+    attempts = YT_ATTEMPTS if label == "YouTube" else [(False, None)]
+    last = None
+    for use_cookies, yt_args in attempts:
+        try:
+            with yt_dlp.YoutubeDL(_opts(use_cookies, video, yt_args)) as ydl:
+                info = ydl.extract_info(page_url, download=False)
+            if info.get("entries"):
+                info = info["entries"][0]
+            return _song_from_info(info, label, video), None
+        except Exception as e:
+            last = str(e)
+            print(f"Error resolve [{label}] {yt_args}: {e}")
+    return None, (last or "Gagal mengambil stream.")[:200]
 
 
 def resolve_song(item):
@@ -737,6 +754,127 @@ async def cinema_callback(event):
                              buttons=[[Button.inline("🏠 Cinema", b"cin:home")]])
         except Exception:
             pass
+
+
+# ==========================================
+# GETLINK: ambil link video (.m3u8 / .mp4) lewat browser sungguhan (Playwright)
+# ==========================================
+MEDIA_RE = re.compile(r"\.(?:m3u8|mp4)(?:\?|$)", re.I)
+AD_RE = re.compile(r"doubleclick|googlesyndication|adsystem|adservice|/ads?/|popads|propeller|exoclick", re.I)
+CF_TITLE_RE = re.compile(r"just a moment|attention required|checking your browser|sebentar", re.I)
+GETLINKS = {}   # chat_id -> {"title": str, "links": [{"url":..., "headers": {...}}]}
+GETLINK_LOCK = asyncio.Lock()
+
+
+async def grab_links(page_url, wait=40):
+    """Buka halaman di Chromium dan tangkap request .m3u8/.mp4. Return (links, title, error)."""
+    try:
+        from playwright.async_api import async_playwright
+    except ImportError:
+        return [], "", ("Playwright belum terpasang. Tambah 'playwright' di requirements.txt "
+                        "dan langkah install Chromium di workflow.")
+
+    found = {}
+    title = ""
+    err = None
+    try:
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(
+                headless=True,
+                args=["--no-sandbox", "--disable-dev-shm-usage",
+                      "--disable-blink-features=AutomationControlled",
+                      "--autoplay-policy=no-user-gesture-required"])
+            try:
+                ctx = await browser.new_context(
+                    user_agent=UA, locale="id-ID", viewport={"width": 1280, "height": 720})
+                await ctx.add_init_script(
+                    "Object.defineProperty(navigator,'webdriver',{get:()=>undefined});")
+                page = await ctx.new_page()
+
+                def on_request(req):
+                    u = req.url
+                    if MEDIA_RE.search(u) and not AD_RE.search(u) and u not in found:
+                        h = req.headers or {}
+                        found[u] = {"Referer": h.get("referer") or page_url,
+                                    "User-Agent": h.get("user-agent") or UA}
+
+                def on_popup(pg):
+                    asyncio.ensure_future(pg.close())  # tutup iklan pop-up
+
+                ctx.on("request", on_request)
+                ctx.on("page", on_popup)
+
+                await page.goto(page_url, wait_until="domcontentloaded", timeout=45000)
+
+                for _ in range(max(1, wait // 2)):
+                    if found:
+                        break
+                    try:
+                        t = await page.title()
+                    except Exception:
+                        t = ""
+                    if CF_TITLE_RE.search(t or ""):   # masih tantangan Cloudflare, tunggu
+                        await asyncio.sleep(2)
+                        continue
+                    try:
+                        await page.mouse.click(640, 360)   # pancing tombol play
+                    except Exception:
+                        pass
+                    for fr in page.frames:
+                        try:
+                            await fr.evaluate(
+                                "() => { const v = document.querySelector('video');"
+                                " if (v) { v.muted = true; v.play().catch(() => {}); } }")
+                        except Exception:
+                            pass
+                    await asyncio.sleep(2)
+
+                try:
+                    title = await page.title()
+                except Exception:
+                    title = ""
+
+                if not found:   # cadangan: baca src <video> langsung
+                    for fr in page.frames:
+                        try:
+                            src = await fr.evaluate(
+                                "() => { const v = document.querySelector('video');"
+                                " return v ? (v.currentSrc || v.src || '') : ''; }")
+                        except Exception:
+                            src = ""
+                        if src.startswith("http") and not AD_RE.search(src):
+                            found[src] = {"Referer": page_url, "User-Agent": UA}
+
+                if not found and CF_TITLE_RE.search(title or ""):
+                    err = ("Cloudflare masih menahan browser juga "
+                           "(IP server GitHub kemungkinan diblokir).")
+            finally:
+                await browser.close()
+    except Exception as e:
+        err = f"{type(e).__name__}: {str(e)[:150]}"
+
+    links = [{"url": u, "headers": h} for u, h in found.items()]
+    links.sort(key=lambda x: 0 if ".m3u8" in x["url"].lower() else 1)
+    return links[:4], title, err
+
+
+async def getlink_play(event, idx):
+    st = GETLINKS.get(event.chat_id)
+    if not st or not (0 <= idx < len(st["links"])):
+        return await event.answer("Daftar kedaluwarsa, jalankan /getlink lagi.", alert=True)
+    err = need_vc()
+    if err:
+        return await event.answer(toast(err), alert=True)
+    await event.answer("⏳ Menyiapkan...")
+    l = st["links"][idx]
+    dur = await probe_duration(l["url"], l["headers"])
+    song = {
+        "url": l["url"], "page": l["url"], "title": st["title"], "duration": dur,
+        "source": "GetLink", "video": True, "force_audio": VIDEO_HEIGHT == 0,
+        "headers": l["headers"], "fmt": "hls" if ".m3u8" in l["url"].lower() else "mp4",
+    }
+    text = await do_enqueue(song)
+    await manager_bot.send_message(event.chat_id, text, buttons=ctrl_buttons())
 
 
 # ==========================================
@@ -1227,6 +1365,7 @@ async def c_help(event):
         "/loop /shuffle /clear /remove N\n"
         "/filter /hemat [144|240|360] /quality audio|144..720\n"
         "/cinema /csearch judul - film LK21\n"
+        "/getlink url - cari link video di halaman (browser)\n"
         "/admins /status\n\n"
         "**Owner:** /setvc @grup /unsetvc /addadmin ID /deladmin ID /getsession /amode"
     )
@@ -1397,6 +1536,36 @@ async def c_vplayurl(event):
     if not song:
         return await m.edit(f"❌ Gagal: {clean(e)}")
     await m.edit(await do_enqueue(song), buttons=ctrl_buttons())
+
+
+@cmd(r"^/getlink(?:\s|$)")
+async def c_getlink(event):
+    url = arg_of(event)
+    if not url.startswith("http"):
+        return await event.reply(
+            "**Usage:** /getlink https://halaman-film...\n"
+            "Bot membuka halaman di browser dan mencari link video (.m3u8/.mp4).")
+    if GETLINK_LOCK.locked():
+        return await event.reply("⏳ Masih ada proses /getlink lain, tunggu sebentar.")
+    m = await event.reply("🌐 Membuka halaman di browser... (bisa 30-60 detik)")
+    async with GETLINK_LOCK:
+        try:
+            links, title, err = await asyncio.wait_for(grab_links(url), 100)
+        except asyncio.TimeoutError:
+            links, title, err = [], "", "Waktu habis."
+    if not links:
+        return await m.edit(
+            f"❌ Link video tidak ketemu.\n{clean(err or 'Tidak ada request video terdeteksi.')}")
+    name = clean(title)[:60] or "Video"
+    GETLINKS[event.chat_id] = {"title": name, "links": links}
+    lines = [f"🔗 **Link ditemukan** ({len(links)})", name, ""]
+    rows = []
+    for i, l in enumerate(links):
+        u = l["url"] if len(l["url"]) <= 250 else l["url"][:247] + "..."
+        lines.append(f"{i + 1}. `{u}`")
+        rows.append([Button.inline(f"▶ Putar #{i + 1}", f"gl:play:{i}".encode())])
+    lines.append("\nTombol Putar paling aman (membawa header Referer). Link juga bisa dipakai: /vplayurl link")
+    await m.edit("\n".join(lines), buttons=rows, link_preview=False)
 
 
 @cmd(r"^/np(?:\s|$)")
@@ -1619,6 +1788,10 @@ async def on_callback(event):
     # --- Cinema (khusus admin) ---
     if data.startswith("cin:"):
         return await cinema_callback(event)
+
+    # --- GetLink ---
+    if data.startswith("gl:play:"):
+        return await getlink_play(event, int(data.split(":")[2]))
 
     # --- khusus owner ---
     if data.startswith(("appr:", "rej:", "deladm:")):
