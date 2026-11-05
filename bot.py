@@ -12,6 +12,9 @@ import urllib.parse
 import urllib.request
 import zipfile
 
+import requests
+from bs4 import BeautifulSoup
+
 import yt_dlp
 from telethon import TelegramClient, events, utils, Button
 from telethon.errors import UserAlreadyParticipantError
@@ -21,7 +24,7 @@ from pytgcalls import PyTgCalls
 from pytgcalls.types import MediaStream, GroupCallConfig
 
 # ==========================================
-# KONFIGURASI (semua dari env / GitHub Secrets)
+# KONFIGURASI
 # ==========================================
 def _env(name, default=""):
     return os.environ.get(name) or default
@@ -29,7 +32,7 @@ def _env(name, default=""):
 def _need(name):
     v = _env(name)
     if not v:
-        raise SystemExit(f"❌ Env {name} belum diisi. Tambahkan di GitHub: Settings > Secrets and variables > Actions.")
+        raise SystemExit(f"❌ Env {name} belum diisi.")
     return v
 
 API_ID = int(_need("API_ID"))
@@ -37,7 +40,9 @@ API_HASH = _need("API_HASH")
 BOT_TOKEN = _need("BOT_TOKEN")
 OWNER_ID = int(_need("OWNER_ID"))
 SESSION_STRING = _env("SESSION_STRING")
-LK21_API_BASE = _env("LK21_API_BASE", "https://api-lk21.vercel.app").rstrip("/")
+
+# URL BASE LK21 BARU (Ganti via GitHub Secrets jika domain berubah)
+LK21_BASE_URL = _env("LK21_BASE_URL", "https://tv12.lk21official.cc").rstrip("/")
 
 SILENT_AUDIO = "https://github.com/anars/blank-audio/raw/master/1-second-of-silence.mp3"
 COOKIES = "cookies.txt"
@@ -93,17 +98,8 @@ DATA_TAG = "MUSICBOT_DATA "
 
 # Cinema State
 CINEMA_ITEMS = {}
-CINEMA_BASE = {}
 CINEMA_VIEW = {}
-CINEMA_LOOKUPS = {}
 CINEMA_PAGE_SIZE = 8
-CINEMA_ENDPOINTS = {
-    "latest": ("movies", "Film terbaru"), "popular": ("popular/movies", "Film populer"),
-    "release": ("recent-release/movies", "Rilis terbaru"), "top": ("top-rated/movies", "Rating tertinggi"),
-    "series": ("series", "Serial terbaru"), "popseries": ("popular/series", "Serial populer"),
-    "seriesrelease": ("recent-release/series", "Rilis serial terbaru"), "seriestop": ("top-rated/series", "Rating serial tertinggi"),
-}
-LOOKUP_PATHS = {"genre": "genres", "country": "countries", "year": "years"}
 
 def get_queue(chat_id): return queues.setdefault(chat_id, [])
 def silent_song(): return {"url": SILENT_AUDIO, "title": "Silent", "duration": 0}
@@ -339,60 +335,54 @@ def resolve_song(item: dict) -> tuple[dict | None, str | None]:
     return song, err
 
 # ==========================================
-# LK21 CINEMA CENTER (FILM & SERIES)
+# LK21 CINEMA CENTER (WEB SCRAPING)
 # ==========================================
 class CinemaError(Exception): pass
 
-def _cinema_http(path):
-    req = urllib.request.Request(LK21_API_BASE + "/" + path.lstrip("/"), headers={"User-Agent": UA, "Accept": "application/json"})
+def _fetch_lk21(url):
+    headers = {'User-Agent': UA, 'Accept': 'text/html,application/xhtml+xml'}
     try:
-        with urllib.request.urlopen(req, timeout=20) as r:
-            return json.loads(r.read(3_000_000).decode(r.headers.get_content_charset() or "utf-8", errors="replace"))
-    except urllib.error.HTTPError as e:
-        raise CinemaError(f"API HTTP {e.code} untuk /{path.lstrip('/')[:60]}")
-    except json.JSONDecodeError:
-        raise CinemaError("API membalas bukan JSON (kemungkinan API mati/diblokir).")
+        resp = requests.get(url, headers=headers, timeout=15)
+        resp.raise_for_status()
+        return BeautifulSoup(resp.text, 'html.parser')
     except Exception as e:
-        raise CinemaError(f"API Error: {e}")
+        raise CinemaError(f"Website Error: {e}")
 
-async def cinema_get(path): return await asyncio.to_thread(_cinema_http, path)
-
-def cinema_pick(obj, *keys):
-    if not isinstance(obj, dict): return None
-    for k in keys:
-        if obj.get(k) not in (None, "", [], {}): return obj[k]
+def _scrape_stream(page_url, depth=2, seen=None):
+    """Fallback: cari .m3u8 atau .mp4 langsung di dalam HTML/iframe"""
+    seen = seen if seen is not None else set()
+    if page_url in seen or len(seen) > 8: return None
+    seen.add(page_url)
+    try:
+        text = requests.get(page_url, headers={'User-Agent': UA}, timeout=15).text
+    except Exception:
+        return None
+    
+    # Cari link m3u8/mp4
+    media = re.findall(r"https?://[^\s\"'<>\\]+?\.(?:m3u8|mp4)(?:\?[^\s\"'<>\\]*)?", text, re.I)
+    if media:
+        m3 = [m for m in media if ".m3u8" in m.lower()]
+        return (m3 or media)[0], page_url
+    
+    if depth <= 0: return None
+    
+    # Cari iframe di dalam halaman
+    iframes = re.findall(r"""<iframe[^>]+(?:src|data-src)=["']([^"']+)["']""", text, re.I)
+    for c in iframes:
+        link = urllib.parse.urljoin(page_url, c.strip())
+        if not link.startswith("http") or re.search(r"youtube|youtu\.be|ads", link, re.I): continue
+        res = _scrape_stream(link, depth - 1, seen)
+        if res: return res
     return None
 
-def cinema_text(value, limit=300):
-    if value is None: return ""
-    value = html.unescape(str(value))
-    value = re.sub(r"<[^>]*>", " ", value)
-    return re.sub(r"\s+", " ", re.sub(r"[*_`\[\]~]", "", value)).strip()[:limit]
+def cinema_home_buttons():
+    return [
+        [Button.inline("🔎 Cara mencari", b"cin:search")],
+        [Button.inline("🔄 Refresh", b"cin:home")]
+    ]
 
-def cinema_items(payload):
-    if isinstance(payload, list): return [x for x in payload if isinstance(x, dict)]
-    if not isinstance(payload, dict): return []
-    for k in ("data", "results", "movies", "series", "items", "result"):
-        v = payload.get(k)
-        if isinstance(v, list): return [x for x in v if isinstance(x, dict)]
-        if isinstance(v, dict):
-            found = cinema_items(v)
-            if found: return found
-    return []
-
-def cinema_id(item):
-    v = cinema_pick(item, "id", "movieId", "movie_id", "seriesId", "series_id", "slug", "_id")
-    return str(v).strip() if v is not None else ""
-
-def cinema_title(item): return cinema_text(cinema_pick(item, "title", "name", "movieTitle", "seriesTitle") or "Tanpa judul", 90)
-
-def cinema_url(item):
-    v = cinema_pick(item, "detail_url", "movie_url", "series_url", "permalink", "web_url", "page_url", "link", "url")
-    if not isinstance(v, str): return None
-    p = urllib.parse.urlparse(v.strip())
-    if p.scheme not in ("http", "https") or not p.netloc: return None
-    if re.search(r"\.(m3u8|mp4|mkv|webm|mov)(\?|$)", p.path, re.I): return None
-    return v.strip()
+def cinema_home_text():
+    return "🎬 **LK21 CINEMA CENTER**\n━━━━━━━━━━━━━━━━━━\nKetik `/csearch judul film` untuk mencari.\n\n_(Gunakan tombol di bawah untuk navigasi)_"
 
 async def cinema_edit(target, text, buttons=None):
     try: return await target.edit(text, buttons=buttons, link_preview=False)
@@ -400,208 +390,96 @@ async def cinema_edit(target, text, buttons=None):
         if hasattr(target, "reply"): return await target.reply(text, buttons=buttons, link_preview=False)
         raise
 
-def cinema_home_buttons():
-    return [
-        [Button.inline("🆕 Film terbaru", b"cin:list:latest:1"), Button.inline("🔥 Film populer", b"cin:list:popular:1")],
-        [Button.inline("🎞 Rilis terbaru", b"cin:list:release:1"), Button.inline("⭐ Rating tertinggi", b"cin:list:top:1")],
-        [Button.inline("📺 Serial terbaru", b"cin:list:series:1"), Button.inline("📈 Serial populer", b"cin:list:popseries:1")],
-        [Button.inline("🎭 Genre", b"cin:lookup:genre"), Button.inline("🔎 Cara mencari", b"cin:search")],
-        [Button.inline("🔄 Refresh", b"cin:home")]
-    ]
+async def cinema_search_list(target, chat_id, query):
+    search_url = f"{LK21_BASE_URL}/search?s={urllib.parse.quote_plus(query)}"
+    try:
+        soup = await asyncio.to_thread(_fetch_lk21, search_url)
+    except Exception as e:
+        return await cinema_edit(target, f"❌ Gagal mencari: {e}")
 
-def cinema_home_text():
-    return "🎬 **LK21 CINEMA CENTER**\n━━━━━━━━━━━━━━━━━━\nJelajahi katalog film dan serial.\n\n`/cinema` - Beranda\n`/csearch judul` - Cari film/serial\n\nPilih kategori melalui tombol di bawah."
+    results = []
+    for article in soup.find_all('article'):
+        link_tag = article.find('a', href=True)
+        if not link_tag: continue
+        
+        title_tag = article.find('h3', class_='poster-title')
+        title = title_tag.get_text(strip=True) if title_tag else "Judul Tidak Diketahui"
+        
+        img_tag = article.find('img')
+        poster = img_tag.get('src') if img_tag else None
+        
+        # Gunakan urljoin untuk link relatif
+        full_link = urllib.parse.urljoin(LK21_BASE_URL + "/", link_tag['href'])
+        
+        results.append({
+            'title': clean(title),
+            'link': full_link,
+            'poster': poster
+        })
 
-async def cinema_list(target, chat_id, kind, page=1, query=""):
-    page = max(1, int(page))
-    if kind in CINEMA_ENDPOINTS:
-        endpoint, label = CINEMA_ENDPOINTS[kind]
-        path = f"{endpoint}?{urllib.parse.urlencode({'page': page})}"
-    elif kind == "search":
-        label = f"Hasil pencarian: {query}"
-        path = "search/" + urllib.parse.quote(query, safe="")
-    elif kind in LOOKUP_PATHS:
-        label = f"{kind.title()}: {query}"
-        path = f"{LOOKUP_PATHS[kind]}/{urllib.parse.quote(query, safe='')}?page={page}"
-    else: raise CinemaError("Kategori tidak dikenal.")
+    if not results:
+        return await cinema_edit(target, f"🎬 **Hasil: {clean(query)}**\n\nTidak ada film ditemukan.", [[Button.inline("🏠 Cinema", b"cin:home")]])
 
-    payload = await cinema_get(path)
-    items = cinema_items(payload)
-    CINEMA_ITEMS[chat_id] = items[:CINEMA_PAGE_SIZE]
-    CINEMA_BASE[chat_id] = len(CINEMA_ITEMS[chat_id])
-    CINEMA_VIEW[chat_id] = {"kind": kind, "page": page, "query": query, "label": label}
+    CINEMA_ITEMS[chat_id] = results[:10]
+    CINEMA_VIEW[chat_id] = {"query": query, "type": "search"}
 
-    if not items: return await cinema_edit(target, f"🎬 **{label}**\n\nTidak ada hasil.", [[Button.inline("🏠 Cinema", b"cin:home")]])
-
-    lines = [f"🎬 **{label}**", f"Halaman {page}", "━━━━━━━━━━━━━━━━━━"]
+    lines = [f"🎬 **Hasil Pencarian: {clean(query)}**", "━━━━━━━━━━━━━━━━━━"]
     rows = []
     for i, item in enumerate(CINEMA_ITEMS[chat_id]):
-        title = cinema_title(item)
-        year = cinema_text(cinema_pick(item, "year", "release_year") or "", 12)
-        rating = cinema_text(cinema_pick(item, "rating", "imdb_rating") or "", 12)
-        meta = " • ".join(x for x in (year, f"★ {rating}" if rating else "") if x)
-        lines.append(f"**{i + 1}. {title}**" + (f"\n   {meta}" if meta else ""))
-        rows.append([Button.inline(f"{i + 1}. {title[:35]}", f"cin:detail:{i}".encode())])
-
-    nav = []
-    if page > 1: nav.append(Button.inline("◀ Sebelumnya", f"cin:page:{page - 1}".encode()))
-    if kind != "search" and len(items) >= CINEMA_PAGE_SIZE: nav.append(Button.inline("Berikutnya ▶", f"cin:page:{page + 1}".encode()))
-    if nav: rows.append(nav)
+        lines.append(f"**{i + 1}. {item['title']}**")
+        rows.append([Button.inline(f"{i + 1}. {item['title'][:35]}", f"cin:detail:{i}".encode())])
+    
     rows.append([Button.inline("🏠 Cinema", b"cin:home")])
     lines.append("\nPilih judul untuk melihat detail.")
     return await cinema_edit(target, "\n".join(lines), rows)
 
-async def cinema_lookup(target, chat_id, kind):
-    payload = await cinema_get(LOOKUP_PATHS[kind])
-    options = payload if isinstance(payload, list) else cinema_items(payload)
-    if not options: raise CinemaError(f"Daftar {kind} kosong.")
-    CINEMA_LOOKUPS.setdefault(chat_id, {})[kind] = options
-    rows = []
-    for i, item in enumerate(options[:60]):
-        name = cinema_pick(item, "name", "title", "value", "year") if isinstance(item, dict) else item
-        rows.append([Button.inline(cinema_text(name or f"Pilihan {i+1}", 30), f"cin:filter:{kind}:{i}".encode())])
-    rows.append([Button.inline("🏠 Cinema", b"cin:home")])
-    return await cinema_edit(target, f"**Pilih {kind}**\n\nTersedia {len(options)} pilihan.", rows)
-
-# ---- Pencari link stream film ----
-PLAY_KEYS = ("stream", "player", "embed", "watch", "iframe", "video", "server")
-MEDIA_RE = re.compile(r"https?://[^\s\"'<>\\]+?\.(?:m3u8|mp4)(?:\?[^\s\"'<>\\]*)?", re.I)
-IFRAME_RE = re.compile(r"""<iframe[^>]+(?:src|data-src)=["']([^"']+)["']""", re.I)
-DATA_URL_RE = re.compile(r"""data-(?:url|src|iframe|embed)=["']([^"']+)["']""", re.I)
-
-def uniq(seq):
-    out = []
-    for x in seq:
-        if x and x not in out: out.append(x)
-    return out
-
-def collect_play_urls(obj, key="", out=None, depth=0):
-    if out is None: out = []
-    if depth > 4 or len(out) >= 8: return out
-    if isinstance(obj, str):
-        if obj.startswith("http") and "trailer" not in key and any(x in key for x in PLAY_KEYS) and obj.strip() not in out:
-            out.append(obj.strip())
-    elif isinstance(obj, dict):
-        for k, v in obj.items(): collect_play_urls(v, f"{key}.{str(k).lower()}", out, depth + 1)
-    elif isinstance(obj, list):
-        for v in obj[:12]: collect_play_urls(v, key, out, depth + 1)
-    return out
-
-def _http_text(url, referer=None, limit=2_000_000):
-    h = {"User-Agent": UA, "Accept": "*/*"}
-    if referer: h["Referer"] = referer
-    with urllib.request.urlopen(urllib.request.Request(url, headers=h), timeout=15) as r:
-        return r.read(limit).decode(r.headers.get_content_charset() or "utf-8", errors="replace")
-
-def _unesc(text): return html.unescape(text).replace("\\/", "/")
-
-def _scrape_stream(page_url, depth=2, seen=None):
-    seen = seen if seen is not None else set()
-    if page_url in seen or len(seen) > 8: return None
-    seen.add(page_url)
-    try: text = _unesc(_http_text(page_url, referer=page_url))
-    except Exception: return None
-    media = MEDIA_RE.findall(text)
-    if media:
-        m3 = [m for m in media if ".m3u8" in m.lower()]
-        return (m3 or media)[0], page_url
-    if depth <= 0: return None
-    for c in IFRAME_RE.findall(text) + DATA_URL_RE.findall(text):
-        link = urllib.parse.urljoin(page_url, c.strip())
-        if not link.startswith("http"): continue
-        res = _scrape_stream(link, depth - 1, seen)
-        if res: return res
-    return None
-
-def _resolve_lk21_sync(pages):
-    errs = []
-    for page in pages:
-        if DIRECT_STREAM_RE.match(page): return page, {"User-Agent": UA}, None
-        song, e = extract_stream(page, video=True)
-        if song and song.get("url"):
-            hdr = song.get("headers") or {"User-Agent": UA, "Referer": page}
-            return song["url"], hdr, None
-        if e: errs.append(cinema_text(e, 80))
-        res = _scrape_stream(page)
-        if res: return res[0], {"User-Agent": UA, "Referer": res[1]}, None
-    return None, None, ("; ".join(errs)[:200] or "Link video tidak ditemukan di halaman/player.")
-
-async def resolve_lk21_stream(item):
-    pages = item.get("pages") or ([item["page"]] if item.get("page") else [])
-    if not pages: return None, None, "URL halaman tidak ditemukan."
-    try: return await asyncio.wait_for(asyncio.to_thread(_resolve_lk21_sync, pages), 70)
-    except asyncio.TimeoutError: return None, None, "Timeout saat mengambil link video."
-    except Exception as e: return None, None, str(e)[:200]
-
-def make_play_item(src, title, fallback_url, poster):
-    pages = uniq(collect_play_urls(src) + ([fallback_url] if fallback_url else []))
-    if not pages: return None
-    return {"pages": pages, "page": pages[0], "title": title, "video": True, "thumb": poster}
-
 async def cinema_detail(target, chat_id, index):
     items = CINEMA_ITEMS.get(chat_id, [])
-    base = CINEMA_BASE.get(chat_id, len(items))
-    if not (0 <= index < base): raise CinemaError("Daftar kedaluwarsa.")
-    del items[base:]
+    if not (0 <= index < len(items)): raise CinemaError("Daftar kedaluwarsa.")
     item = items[index]
-    kind = CINEMA_VIEW.get(chat_id, {}).get("kind", "latest")
-    is_series = "series" in kind or "series" in str(cinema_pick(item, "type", "kind", "media_type") or "").lower()
-    ident = cinema_id(item)
-    if not ident: raise CinemaError("ID detail tidak ditemukan.")
+    
+    try:
+        soup = await asyncio.to_thread(_fetch_lk21, item['link'])
+    except Exception as e:
+        return await cinema_edit(target, f"❌ Gagal membuka detail: {e}")
 
-    detail = await cinema_get(f"{'series' if is_series else 'movies'}/{urllib.parse.quote(ident, safe='')}")
-    if isinstance(detail, dict) and isinstance(detail.get("data"), dict): detail = detail["data"]
-    if not isinstance(detail, dict): detail = item
-
-    title = cinema_title(detail)
-    synopsis = cinema_text(cinema_pick(detail, "synopsis", "description", "overview", "plot") or "Sinopsis belum tersedia.", 1000)
-    lines = [f"🎬 **{title}**", "━━━━━━━━━━━━━━━━━━"]
-    for lbl, keys in (("Tahun", ("year", "release_year")), ("Genre", ("genre", "genres")), ("Negara", ("country",)), ("Durasi", ("duration",)), ("Rating", ("rating",))):
-        v = cinema_pick(detail, *keys)
-        if v: lines.append(f"**{lbl}:** {cinema_text(', '.join(cinema_text(x) for x in v[:3]) if isinstance(v, list) else v, 120)}")
-    lines.extend(["", f"**Sinopsis**\n{synopsis}"])
-
-    poster = cinema_pick(detail, "poster", "poster_url", "thumbnail", "image")
-    poster = poster if isinstance(poster, str) and poster.startswith("http") else None
+    # Ambil info dari halaman detail
+    title = item['title']
+    
+    # Cari sinopsis yang lebih terarah
+    synopsis_tag = soup.find('div', class_='synopsis') or soup.find('div', class_='entry-content')
+    synopsis = synopsis_tag.get_text(strip=True) if synopsis_tag else "Sinopsis belum tersedia."
+    if len(synopsis) > 400:
+        synopsis = synopsis[:400] + "..."
+    
+    lines = [f"🎬 **{clean(title)}**", "━━━━━━━━━━━━━━━━━━", f"**Sinopsis:**\n{clean(synopsis)}"]
+    
     buttons = []
-    page_url = cinema_url(detail) or cinema_url(item)
-
-    if is_series:
-        episodes = []
-        raw_eps = cinema_pick(detail, "episodes", "episode", "list_episode")
-        if isinstance(raw_eps, list):
-            episodes = raw_eps
-        elif isinstance(detail.get("seasons"), list):
-            for season in detail["seasons"]:
-                if isinstance(season, dict) and isinstance(season.get("episodes"), list):
-                    episodes.extend(season["episodes"])
-        episodes = [e for e in episodes if isinstance(e, dict)]
-
-        if episodes:
-            lines.append("\n🎬 **Pilih Episode:**")
-            for ep_idx, ep in enumerate(episodes[:20]):
-                ep_title = cinema_text(cinema_pick(ep, "title", "name", "episode") or f"Episode {ep_idx + 1}", 20)
-                play = make_play_item(ep, f"{title} - {ep_title}", cinema_url(ep), poster)
-                if play:
-                    items.append(play)
-                    buttons.append(Button.inline(f"▶ {ep_title}", f"cin:play:{len(items) - 1}".encode()))
-                else:
-                    buttons.append(Button.inline(f"❌ {ep_title} (No Link)", b"cin:no_link"))
-        else:
-            lines.append("\n*(Daftar episode tidak tersedia dari API)*")
-            play = make_play_item(detail, title, page_url, poster)
-            if play:
-                items.append(play)
-                buttons.append(Button.inline("▶ Coba putar", f"cin:play:{len(items) - 1}".encode()))
-        if page_url: buttons.append(Button.url("🌐 Buka di Web", page_url))
+    meta_redirect = soup.find('meta', attrs={'http-equiv': 'refresh'})
+    if meta_redirect and 'url=' in meta_redirect.get('content', '').lower():
+        target_url = meta_redirect['content'].split('url=')[-1]
+        target_url = urllib.parse.urljoin(LK21_BASE_URL + "/", target_url)
+        buttons.append(Button.url("🌐 Buka di Nontondrama", target_url))
+        lines.append("\n*(Ini adalah Series. Silakan buka link di atas untuk memilih episode)*")
     else:
-        play = make_play_item(detail, title, page_url, poster)
-        if play:
-            items.append(play)
-            buttons.append(Button.inline("▶ Putar di VC", f"cin:play:{len(items) - 1}".encode()))
-        if page_url: buttons.append(Button.url("🌐 Buka di Web", page_url))
+        # Cari iframe yang BUKAN YouTube atau Iklan
+        stream_url = None
+        for f in soup.find_all('iframe', src=True):
+            s = urllib.parse.urljoin(item['link'], f['src'])
+            if not re.search(r"youtube|youtu\.be|ads|doubleclick", s, re.I):
+                stream_url = s
+                break
+        
+        if stream_url:
+            item['stream_url'] = stream_url
+            if is_admin(chat_id):
+                buttons.append(Button.inline("▶ Putar di VC", f"cin:play:{index}".encode()))
+            else:
+                buttons.append(Button.inline("▶ Putar (Khusus Admin)", b"cin:no_link"))
+            buttons.append(Button.url("🌐 Buka Player", stream_url))
+        else:
+            lines.append("\n❌ Link streaming tidak ditemukan di halaman ini.")
 
-    if poster: buttons.append(Button.url("🖼 Poster", poster))
     buttons.append(Button.inline("⬅️ Kembali", b"cin:back"))
     buttons.append(Button.inline("🏠 Cinema", b"cin:home"))
 
@@ -612,23 +490,36 @@ async def cinema_play(event, chat_id, index):
     if not is_admin(event.sender_id): return await event.answer("⛔ Playback khusus admin.", alert=True)
     err = need_vc()
     if err: return await event.answer(toast(err), alert=True)
+    
     items = CINEMA_ITEMS.get(chat_id, [])
-    if not (0 <= index < len(items)) or "pages" not in items[index]:
+    if not (0 <= index < len(items)) or 'stream_url' not in items[index]:
         return await event.answer("Daftar kedaluwarsa, buka detail lagi.", alert=True)
+    
     item = items[index]
-    await event.answer("⏳ Mengambil link video... tunggu sekitar 15 detik")
-
-    stream_url, headers, err = await resolve_lk21_stream(item)
-    if not stream_url:
-        return await manager_bot.send_message(
-            chat_id, f"❌ Gagal ambil link video.\n{clean(err)}\n\nCoba buka lewat web, atau putar link embed/m3u8 langsung pakai /vplayurl.")
-
-    dur = await probe_duration(stream_url, headers)
-    song = {
-        "url": stream_url, "title": item.get("title") or "LK21 Stream", "duration": dur,
-        "source": "LK21", "video": True, "page": item.get("page"), "thumb": item.get("thumb"),
-        "headers": headers, "fmt": "m3u8" if ".m3u8" in stream_url.lower() else "mp4",
-    }
+    stream_url = item['stream_url']
+    
+    await event.answer("⏳ Mengambil link video... tunggu sebentar")
+    
+    # Coba 1: Resolve via yt-dlp (bisa menembus beberapa embed player)
+    song, e = await asyncio.to_thread(resolve_song, {"page": stream_url, "title": item["title"], "source": "LK21", "video": True})
+    
+    # Coba 2: Jika yt-dlp gagal, gunakan _scrape_stream (fallback)
+    if not song:
+        print(f"yt-dlp gagal untuk {stream_url}: {e}. Mencoba fallback scraper...")
+        res = await asyncio.to_thread(_scrape_stream, stream_url)
+        if res:
+            real_url, referer = res
+            song = {
+                "url": real_url, "page": stream_url, "title": item["title"], 
+                "duration": 0, "source": "LK21", "video": True, 
+                "headers": {"User-Agent": UA, "Referer": referer}
+            }
+        else:
+            return await manager_bot.send_message(chat_id, f"❌ Gagal memutar video.\nError: {clean(e)}\n\nCoba klik tombol 'Buka Player' untuk menonton di browser.")
+    
+    dur = await probe_duration(song["url"], song.get("headers"))
+    song["duration"] = dur
+    
     text = await do_enqueue(song)
     await manager_bot.send_message(chat_id, text, buttons=ctrl_buttons())
 
@@ -641,28 +532,16 @@ async def cinema_callback(event):
         await event.answer()
         if data == "cin:no_link": return
         if data == "cin:home": return await cinema_edit(event, cinema_home_text(), cinema_home_buttons())
-        if data == "cin:search": return await cinema_edit(event, "🔎 Gunakan `/csearch judul`", [[Button.inline("🏠 Cinema", b"cin:home")]])
-        if data.startswith("cin:list:"):
-            _, _, kind, page = data.split(":", 3)
-            return await cinema_list(event, chat_id, kind, int(page))
-        if data.startswith("cin:page:"):
-            view = CINEMA_VIEW.get(chat_id, {})
-            return await cinema_list(event, chat_id, view.get("kind", "latest"), int(data.split(":")[2]), view.get("query", ""))
-        if data.startswith("cin:lookup:"): return await cinema_lookup(event, chat_id, data.split(":")[2])
-        if data.startswith("cin:filter:"):
-            _, _, kind, index = data.split(":", 3)
-            opts = CINEMA_LOOKUPS.get(chat_id, {}).get(kind, [])
-            if not (0 <= int(index) < len(opts)): raise CinemaError("Filter kedaluwarsa.")
-            o = opts[int(index)]
-            val = cinema_pick(o, "slug", "id", "name", "title", "value", "year") if isinstance(o, dict) else o
-            return await cinema_list(event, chat_id, kind, 1, str(val))
+        if data == "cin:search": return await cinema_edit(event, "🔎 Gunakan `/csearch judul film`", [[Button.inline("🏠 Cinema", b"cin:home")]])
         if data.startswith("cin:detail:"): return await cinema_detail(event, chat_id, int(data.split(":")[2]))
         if data == "cin:back":
             v = CINEMA_VIEW.get(chat_id, {})
-            if v.get("kind") in (None, "home"): return await cinema_edit(event, cinema_home_text(), cinema_home_buttons())
-            return await cinema_list(event, chat_id, v.get("kind", "latest"), int(v.get("page", 1)), v.get("query", ""))
+            if v.get("type") == "search":
+                return await cinema_search_list(event, chat_id, v.get("query", ""))
+            return await cinema_edit(event, cinema_home_text(), cinema_home_buttons())
     except Exception as e:
-        try: await event.edit(f"⚠️ Cinema: {cinema_text(e, 250)}", buttons=[[Button.inline("🏠 Cinema", b"cin:home")]])
+        # Fix: cinema_text diganti clean
+        try: await event.edit(f"⚠️ Cinema: {clean(str(e))[:250]}", buttons=[[Button.inline("🏠 Cinema", b"cin:home")]])
         except Exception: pass
 
 # ==========================================
@@ -992,7 +871,7 @@ def cmd(pattern, owner=False):
 
 @manager_bot.on(events.NewMessage(pattern=r"^/cinema(?:\s|$)", func=lambda e: e.is_private))
 async def cinema_command(event):
-    CINEMA_VIEW[event.chat_id] = {"kind": "home", "page": 1}
+    CINEMA_VIEW[event.chat_id] = {"kind": "home"}
     await event.reply(cinema_home_text(), buttons=cinema_home_buttons(), link_preview=False)
 
 @manager_bot.on(events.NewMessage(pattern=r"^/csearch(?:\s|$)", func=lambda e: e.is_private))
@@ -1000,9 +879,9 @@ async def cinema_search_command(event):
     parts = (event.raw_text or "").split(None, 1)
     if len(parts) < 2 or not parts[1].strip():
         return await event.reply("Cara mencari: `/csearch judul film`", buttons=[[Button.inline("🏠 Cinema", b"cin:home")]])
-    status = await event.reply("🔎 Mencari katalog...")
-    try: await cinema_list(status, event.chat_id, "search", 1, parts[1].strip())
-    except Exception as e: await status.edit(f"⚠️ Error: {cinema_text(e, 250)}", buttons=[[Button.inline("🏠 Cinema", b"cin:home")]])
+    status = await event.reply("🔎 Mencari di LK21...")
+    try: await cinema_search_list(status, event.chat_id, parts[1].strip())
+    except Exception as e: await status.edit(f"⚠️ Error: {clean(str(e))}", buttons=[[Button.inline("🏠 Cinema", b"cin:home")]])
 
 @cmd(r"^/(start|panel|menu)(?:\s|$)")
 async def c_start(event): await event.reply(panel_text(), buttons=panel_buttons(event.sender_id))
@@ -1190,7 +1069,7 @@ async def c_getsession(event):
 @cmd(r"^/status(?:\s|$)")
 async def c_status(event):
     up = int(time.time() - START_TIME)
-    await event.reply(f"📊 **Status**\nUptime: {up // 3600}j {up % 3600 // 60}m\nUserbot: {'online' if userbot_call else 'offline'}\nVC: {TARGET_VC_ID or 'belum diset'}\nAdmin: {len(DATA['admins'])} + owner\nCookies: {'ada' if os.path.exists(COOKIES) else 'tidak ada'}\nAPI film: {LK21_API_BASE}")
+    await event.reply(f"📊 **Status**\nUptime: {up // 3600}j {up % 3600 // 60}m\nUserbot: {'online' if userbot_call else 'offline'}\nVC: {TARGET_VC_ID or 'belum diset'}\nAdmin: {len(DATA['admins'])} + owner\nCookies: {'ada' if os.path.exists(COOKIES) else 'tidak ada'}\nScraper: LK21 Web (Aktif)")
 
 # ==========================================
 # CALLBACKS
@@ -1231,7 +1110,6 @@ async def on_callback(event):
             ASKED.discard(uid); return await event.answer(f"Gagal: {e}"[:190], alert=True)
         return await event.answer("✅ Dikirim ke owner.", alert=True)
 
-    # Cinema: browsing terbuka untuk semua, playback dicek admin di dalamnya
     if data.startswith("cin:"): return await cinema_callback(event)
 
     if not is_admin(uid): return await event.answer("⛔ Kamu bukan admin.", alert=True)
