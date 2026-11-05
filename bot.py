@@ -1350,7 +1350,7 @@ async def main():
     await manager_bot.run_until_disconnected()
 
 
-if name == "main":
+if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
