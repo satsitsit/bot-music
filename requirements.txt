@@ -1,3 +1,5 @@
-telethon>=1.36
-py-tgcalls>=2.0
+telethon
+py-tgcalls
 yt-dlp[default]
+requests
+beautifulsoup4
