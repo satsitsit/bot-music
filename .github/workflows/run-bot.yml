@@ -1,4 +1,4 @@
-name: Run Bot
+name: Run Music Bot
 
 on:
   workflow_dispatch:
@@ -26,27 +26,23 @@ jobs:
           node-version: "20"
 
       - name: Install ffmpeg
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y ffmpeg
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg
 
       - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
+        run: pip install -r requirements.txt
 
-      - name: Tulis cookies dari secret
+      - name: Tulis cookies
         env:
-          COOKIES_TXT: ${{ secrets.COOKIES_TXT }}
+          YT_COOKIES: ${{ secrets.YT_COOKIES }}
         run: |
-          if [ -n "$COOKIES_TXT" ]; then printf '%s\n' "$COOKIES_TXT" > cookies.txt; fi
+          if [ -n "$YT_COOKIES" ]; then printf '%s\n' "$YT_COOKIES" > cookies.txt; fi
 
-      - name: Run Bot
+      - name: Jalankan bot
         env:
           API_ID: ${{ secrets.API_ID }}
           API_HASH: ${{ secrets.API_HASH }}
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
           OWNER_ID: ${{ secrets.OWNER_ID }}
           SESSION_STRING: ${{ secrets.SESSION_STRING }}
-          LK21_API_BASE: ${{ secrets.LK21_API_BASE }}
-        run: python -u bot.py
+          LK21_BASE_URL: ${{ secrets.LK21_BASE_URL }}
+        run: python bot.py
