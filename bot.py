@@ -5,13 +5,10 @@ import os
 import random
 import re
 import shutil
-import tempfile
 import time
-import urllib.parse
 import zipfile
 
 import yt_dlp
-from bs4 import BeautifulSoup
 from telethon import TelegramClient, events, utils, Button
 from telethon.errors import UserAlreadyParticipantError
 from telethon.sessions import MemorySession, StringSession
@@ -19,44 +16,23 @@ from telethon.tl.functions.messages import ImportChatInviteRequest, CheckChatInv
 from pytgcalls import PyTgCalls
 from pytgcalls.types import MediaStream, GroupCallConfig
 
-# curl_cffi menyamar sebagai Chrome (menghindari 403 dari LK21).
-# Kalau belum terpasang, otomatis pakai requests biasa.
-try:
-    from curl_cffi import requests as web
-    IMPERSONATE = {"impersonate": "chrome"}
-except ImportError:
-    import requests as web
-    IMPERSONATE = {}
-
 # ==========================================
-# KONFIGURASI (semua rahasia WAJIB lewat GitHub Secrets / env)
+# KONFIGURASI
+# Nilai dibaca dari Secrets/env dulu. Kalau kosong, pakai nilai di sini.
+# (Kalau repo PUBLIC, kosongkan nilai bawaan di bawah dan isi lewat Secrets!)
 # ==========================================
 def _env(name, default=""):
     return os.environ.get(name) or default
 
 
-def _need(name):
-    v = _env(name)
-    if not v:
-        raise SystemExit(f"❌ Env {name} belum diisi (isi di GitHub Secrets).")
-    return v
-
-
-API_ID = int(_need("API_ID"))
-API_HASH = _need("API_HASH")
-BOT_TOKEN = _need("BOT_TOKEN")
-OWNER_ID = int(_need("OWNER_ID"))
+API_ID = int(_env("API_ID", "32333215"))
+API_HASH = _env("API_HASH", "3d9a1c2ab47d6a7b6fff1b452ab22452")
+BOT_TOKEN = _env("BOT_TOKEN", "9183135814:AAFpb7Q9MZwU46edK1ME7sL5FR690ydIDwg")
+OWNER_ID = int(_env("OWNER_ID", "8962307609"))
 SESSION_STRING = _env("SESSION_STRING")  # opsional: userbot otomatis nyala tanpa upload zip
 
-# Domain LK21 (ganti lewat Secret LK21_BASE_URL kalau domain berubah)
-LK21_BASE_URL = _env("LK21_BASE_URL", "https://tv12.lk21official.cc").rstrip("/")
-
 SILENT_AUDIO = "https://github.com/anars/blank-audio/raw/master/1-second-of-silence.mp3"
-COOKIES = "cookies.txt"  # opsional (ditulis dari Secret YT_COOKIES oleh workflow)
-UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36"
-
-TMP_DIR = tempfile.gettempdir()
-SESSION_BASE = os.path.join(TMP_DIR, "userbot_session")
+COOKIES = "cookies.txt"  # opsional
 
 # ---- FILTER LAGU ----
 FILTER_ON = True
@@ -102,14 +78,9 @@ timers = {}
 PENDING = {}        # chat_id admin -> {"results": [...], "mids": [...]}
 REQUESTS = {}       # uid -> nama (permintaan akses admin)
 ASKED = set()
-PLAY_ERRORS = {}
 DATA = {"admins": {}}   # admins: {"id": "nama"}
 DATA_DIRTY = False
 DATA_TAG = "MUSICBOT_DATA "
-
-# Cinema
-CINEMA_ITEMS = {}
-CINEMA_VIEW = {}
 
 
 def get_queue(chat_id):
@@ -121,15 +92,13 @@ def silent_song():
 
 
 def clean(text):
-    return re.sub(r"[*_\[\]~`]", "", str(text or ""))
+    return re.sub(r"[*_`\[\]~]", "", str(text or ""))
 
 
 def fmt_dur(sec):
     if not sec:
         return "?"
     sec = int(sec)
-    if sec >= 3600:
-        return f"{sec // 3600}:{sec % 3600 // 60:02d}:{sec % 60:02d}"
     return f"{sec // 60}:{sec % 60:02d}"
 
 
@@ -236,33 +205,23 @@ def _video_quality_candidates():
     return out
 
 
-def _mk_stream(url, headers=None, **kw):
-    if headers:
-        try:
-            return MediaStream(url, headers=headers, **kw)
-        except TypeError:
-            pass
-    return MediaStream(url, **kw)
-
-
-def video_stream(url, headers=None):
+def video_stream(url):
     for q in _video_quality_candidates():
         try:
-            return _mk_stream(url, headers, video_parameters=q)
+            return MediaStream(url, video_parameters=q)
         except Exception:
             continue
-    return _mk_stream(url, headers)
+    return MediaStream(url)
 
 
 def make_stream(song):
-    url = song["url"]
     if song.get("force_audio"):
-        return audio_stream(url)
+        return audio_stream(song["url"])
     if song.get("video"):
-        return video_stream(url, song.get("headers"))
+        return video_stream(song["url"])
     if AUDIO_PLAIN:
-        return MediaStream(url)
-    return audio_stream(url)
+        return MediaStream(song["url"])
+    return audio_stream(song["url"])
 
 
 async def call_any(names, *args, **kwargs):
@@ -273,75 +232,21 @@ async def call_any(names, *args, **kwargs):
     raise AttributeError(f"Method {names} tidak ada di versi py-tgcalls ini")
 
 
-async def probe_duration(url, headers=None):
-    cmd = ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "default=nw=1:nk=1"]
-    if headers:
-        cmd += ["-headers", "".join(f"{k}: {v}\r\n" for k, v in headers.items())]
-    cmd.append(url)
-    p = None
-    try:
-        p = await asyncio.create_subprocess_exec(
-            *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
-        out, _ = await asyncio.wait_for(p.communicate(), 25)
-        return int(float(out.decode().strip()))
-    except Exception:
-        if p and p.returncode is None:
-            try:
-                p.kill()
-            except Exception:
-                pass
-        return 0
-
-
 # ==========================================
-# PENCARIAN, FILTER, AMBIL LINK (yt-dlp, multi-platform)
+# PENCARIAN, FILTER, AMBIL LINK
 # ==========================================
-DIRECT_STREAM_RE = re.compile(r"^https?://[^\s]+\.(?:m3u8|mp4|webm|mkv|mov|flv|ts)(?:\?|$)", re.I)
-
-
-# YouTube sering menolak satu client saja ("Requested format is not available").
-# Dicoba berurutan; yang terakhir memakai cookies (kalau cookies.txt ada).
-YT_ATTEMPTS = [
-    (False, {"player_client": ["android_vr"]}),
-    (False, {"player_client": ["web_embedded"]}),
-    (False, {"player_client": ["tv"]}),
-    (True, None),
-]
-
-
-def detect_source(url):
-    low = (url or "").lower()
-    if "youtube.com" in low or "youtu.be" in low:
-        return "YouTube"
-    if "soundcloud.com" in low:
-        return "SoundCloud"
-    if "vimeo.com" in low:
-        return "Vimeo"
-    if DIRECT_STREAM_RE.match(url or ""):
-        return "Direct"
-    return "Web"
-
-
-def _opts(use_cookies, video=False, yt_args=None):
-    h = VIDEO_HEIGHT or 480
-    if video:
-        # satu file yang sudah berisi video+suara (ffmpeg hanya menerima 1 URL)
-        fmt = f"best[height<={h}][vcodec!=none][acodec!=none]/best[height<={h}]/best"
-    else:
-        fmt = "bestaudio[ext=m4a]/bestaudio/best"
+def _opts(use_cookies, video=False):
+    h = VIDEO_HEIGHT
+    fmt = (f"best[height<={h}][vcodec!=none][acodec!=none]/best[height<={h}]/best"
+           if video else "bestaudio[ext=m4a]/bestaudio/best")
     opts = {
         "format": fmt,
         "noplaylist": True,
         "quiet": True,
         "no_warnings": True,
-        "nocheckcertificate": True,
-        "geo_bypass": True,
         "js_runtimes": {"node": {}},
         "remote_components": ["ejs:github"],
-        "extractor_args": {"generic": {"impersonate": [""]}},
     }
-    if yt_args:
-        opts["extractor_args"]["youtube"] = yt_args
     if use_cookies and os.path.exists(COOKIES):
         opts["cookiefile"] = COOKIES
     return opts
@@ -413,468 +318,63 @@ def _song_from_info(v, label, video=False):
     url = v.get("url")
     if not url and v.get("requested_formats"):
         url = v["requested_formats"][0].get("url")
-    if not url and v.get("formats"):
-        best = max((f for f in v["formats"] if f.get("url")),
-                   key=lambda x: x.get("tbr") or x.get("abr") or 0, default=None)
-        if best:
-            url = best["url"]
     if not url:
-        raise RuntimeError("Link stream tidak tersedia.")
+        raise RuntimeError("Link audio tidak tersedia.")
     return {
         "url": url,
-        "page": v.get("webpage_url") or v.get("original_url"),
         "title": v.get("title", "Unknown"),
         "duration": int(v.get("duration") or 0),
         "source": label,
-        "channel": v.get("channel") or v.get("uploader") or "",
-        "thumb": v.get("thumbnail"),
         "video": video,
         "fmt": f"{v.get('ext', '?')}/{v.get('protocol', '?')}",
-        "headers": v.get("http_headers") if label == "Web" else None,
     }
 
 
-def extract_stream(page_url, video=False):
-    label = detect_source(page_url)
-    if label == "Direct" or DIRECT_STREAM_RE.match(page_url):
-        return {"url": page_url, "page": page_url, "title": "Direct Stream", "duration": 0,
-                "source": "Direct", "video": video}, None
-    attempts = YT_ATTEMPTS if label == "YouTube" else [(False, None)]
-    last = None
-    for use_cookies, yt_args in attempts:
+def _resolve_url(page, use_cookies, label, video=False):
+    with yt_dlp.YoutubeDL(_opts(use_cookies, video)) as ydl:
+        v = ydl.extract_info(page, download=False)
+    if v.get("entries"):
+        v = v["entries"][0]
+    return _song_from_info(v, label, video)
+
+
+def _resolve_song(item):
+    src = item.get("source")
+    video = bool(item.get("video"))
+    audio_movie = video and VIDEO_HEIGHT == 0
+    if audio_movie:
+        video = False
+    errors = []
+    if item.get("video") and re.search(r"\.(mp4|mkv|webm|m3u8|mov)(\?|$)", item["page"], re.I):
+        return {"url": item["page"], "title": item["title"], "duration": 0,
+                "source": "Link", "video": video, "force_audio": audio_movie}, None
+    try:
+        song = _resolve_url(item["page"], src == "YouTube", src or "YouTube", video)
+        song["force_audio"] = audio_movie
+        return song, None
+    except Exception as e:
+        print(f"Error resolve [{src}]: {e}")
+        errors.append(f"{src}: {str(e)[:120]}")
+
+    if src != "SoundCloud" and not item.get("video"):
         try:
-            with yt_dlp.YoutubeDL(_opts(use_cookies, video, yt_args)) as ydl:
-                info = ydl.extract_info(page_url, download=False)
-            if info.get("entries"):
-                info = info["entries"][0]
-            return _song_from_info(info, label, video), None
+            alt = _flat_search("scsearch", "SoundCloud", item["title"], 3)
+            if alt:
+                return _resolve_url(alt[0]["page"], False, "SoundCloud"), None
+            errors.append("SoundCloud: tidak ada hasil")
         except Exception as e:
-            last = str(e)
-            print(f"Error resolve [{label}] {yt_args}: {e}")
-    return None, (last or "Gagal mengambil stream.")[:200]
+            print(f"Error fallback SC: {e}")
+            errors.append(f"SoundCloud: {str(e)[:120]}")
+    return None, "\n".join(errors)
 
 
 def resolve_song(item):
-    page = item.get("page") or item.get("url")
-    if not page:
-        return None, "URL tidak valid."
-    video = bool(item.get("video"))
-    audio_movie = video and VIDEO_HEIGHT == 0   # mode "audio": film cuma suaranya
-    if audio_movie:
-        video = False
-
-    song, err = extract_stream(page, video=video)
-
-    # Cadangan: kalau YouTube gagal, cari judul yang sama di SoundCloud (khusus audio)
-    title = item.get("title") or ""
-    if not song and not item.get("video") and detect_source(page) == "YouTube" \
-            and title and not title.startswith("http"):
-        try:
-            alt = _flat_search("scsearch", "SoundCloud", title, 3)
-            if alt:
-                song, e2 = extract_stream(alt[0]["page"])
-                err = None if song else f"{err}\nSoundCloud: {e2}"
-            else:
-                err = f"{err}\nSoundCloud: tidak ada hasil"
-        except Exception as e:
-            print(f"Error fallback SC: {e}")
-            err = f"{err}\nSoundCloud: {str(e)[:120]}"
-
+    song, err = _resolve_song(item)
     if song:
-        song["force_audio"] = audio_movie
-        if item.get("keep_title") and title:
-            song["title"] = title
-        else:
-            song.setdefault("title", title or "Unknown")
-        if not song.get("duration"):
-            song["duration"] = int(item.get("duration") or 0)
-        song["thumb"] = song.get("thumb") or item.get("thumb")
-        song["channel"] = song.get("channel") or item.get("channel", "")
-        song["page"] = page
+        song["thumb"] = item.get("thumb")
+        song["channel"] = item.get("channel", "")
+        song["page"] = item.get("page")
     return song, err
-
-
-# ==========================================
-# LK21 CINEMA (web scraping)
-# ==========================================
-class CinemaError(Exception):
-    pass
-
-
-def _get(url, referer=None, timeout=15):
-    headers = {"Accept-Language": "id,en;q=0.8"}
-    if referer:
-        headers["Referer"] = referer
-    if not IMPERSONATE:
-        headers["User-Agent"] = UA
-    return web.get(url, headers=headers, timeout=timeout, **IMPERSONATE)
-
-
-def _fetch_lk21(url):
-    try:
-        resp = _get(url, referer=LK21_BASE_URL + "/")
-        resp.raise_for_status()
-        return BeautifulSoup(resp.text, "html.parser")
-    except Exception as e:
-        raise CinemaError(f"Website Error: {e}")
-
-
-def _scrape_stream(page_url, depth=2, seen=None, referer=None):
-    """Cadangan: cari .m3u8 / .mp4 langsung di HTML / iframe."""
-    seen = seen if seen is not None else set()
-    if page_url in seen or len(seen) > 8:
-        return None
-    seen.add(page_url)
-    try:
-        text = _get(page_url, referer=referer or LK21_BASE_URL + "/").text
-    except Exception:
-        return None
-
-    media = re.findall(r"https?://[^\s\"'<>\\]+?\.(?:m3u8|mp4)(?:\?[^\s\"'<>\\]*)?", text, re.I)
-    if media:
-        m3 = [m for m in media if ".m3u8" in m.lower()]
-        return (m3 or media)[0], page_url
-
-    if depth <= 0:
-        return None
-
-    iframes = re.findall(r"""<iframe[^>]+(?:src|data-src)=["']([^"']+)["']""", text, re.I)
-    for c in iframes:
-        link = urllib.parse.urljoin(page_url, c.strip())
-        if not link.startswith("http") or re.search(r"youtube|youtu\.be|ads", link, re.I):
-            continue
-        res = _scrape_stream(link, depth - 1, seen, referer=page_url)
-        if res:
-            return res
-    return None
-
-
-def _parse_search(soup):
-    results, seen = [], set()
-
-    def add(a, title, poster):
-        href = (a.get("href") or "").strip()
-        if not href or href.startswith(("#", "javascript:")):
-            return
-        link = urllib.parse.urljoin(LK21_BASE_URL + "/", href)
-        if urllib.parse.urlparse(link).path.strip("/") == "" or link in seen:
-            return
-        title = (title or "").strip()
-        if not title:
-            return
-        seen.add(link)
-        results.append({"title": clean(title), "link": link, "poster": poster})
-
-    for art in soup.find_all("article"):
-        a = art.find("a", href=True)
-        if not a:
-            continue
-        t = art.find(["h3", "h2"])
-        img = art.find("img")
-        title = t.get_text(" ", strip=True) if t else (
-            (img.get("alt") if img else "") or a.get("title") or "")
-        add(a, title, img.get("src") if img else None)
-
-    if not results:  # cadangan kalau struktur halaman bukan <article>
-        for a in soup.find_all("a", href=True):
-            img = a.find("img")
-            if not img:
-                continue
-            t = a.find(["h3", "h2"])
-            title = t.get_text(" ", strip=True) if t else (img.get("alt") or a.get("title") or "")
-            add(a, title, img.get("src"))
-    return results
-
-
-def cinema_home_buttons():
-    return [
-        [Button.inline("🔎 Cara mencari", b"cin:search")],
-        [Button.inline("🔄 Refresh", b"cin:home")],
-    ]
-
-
-def cinema_home_text():
-    return ("🎬 **LK21 CINEMA CENTER**\n━━━━━━━━━━━━━━━━━━\n"
-            "Ketik `/csearch judul film` untuk mencari.\n\n"
-            "_(Gunakan tombol di bawah untuk navigasi)_")
-
-
-async def cinema_edit(target, text, buttons=None):
-    try:
-        return await target.edit(text, buttons=buttons, link_preview=False)
-    except Exception:
-        if hasattr(target, "reply"):
-            return await target.reply(text, buttons=buttons, link_preview=False)
-        raise
-
-
-async def cinema_search_list(target, chat_id, query):
-    search_url = f"{LK21_BASE_URL}/search?s={urllib.parse.quote_plus(query)}"
-    try:
-        soup = await asyncio.to_thread(_fetch_lk21, search_url)
-    except Exception as e:
-        return await cinema_edit(target, f"❌ Gagal mencari: {clean(str(e))}",
-                                 [[Button.inline("🏠 Cinema", b"cin:home")]])
-
-    results = _parse_search(soup)
-    if not results:
-        print(f"[cinema] 0 hasil dari {search_url} (panjang html {len(str(soup))})")
-        return await cinema_edit(
-            target, f"🎬 **Hasil: {clean(query)}**\n\nTidak ada film ditemukan.",
-            [[Button.inline("🏠 Cinema", b"cin:home")]])
-
-    CINEMA_ITEMS[chat_id] = results[:10]
-    CINEMA_VIEW[chat_id] = {"query": query, "type": "search"}
-
-    lines = [f"🎬 **Hasil Pencarian: {clean(query)}**", "━━━━━━━━━━━━━━━━━━"]
-    rows = []
-    for i, item in enumerate(CINEMA_ITEMS[chat_id]):
-        lines.append(f"**{i + 1}. {item['title']}**")
-        rows.append([Button.inline(f"{i + 1}. {item['title'][:35]}", f"cin:detail:{i}".encode())])
-    rows.append([Button.inline("🏠 Cinema", b"cin:home")])
-    lines.append("\nPilih judul untuk melihat detail.")
-    return await cinema_edit(target, "\n".join(lines), rows)
-
-
-async def cinema_detail(target, chat_id, index):
-    items = CINEMA_ITEMS.get(chat_id, [])
-    if not (0 <= index < len(items)):
-        raise CinemaError("Daftar kedaluwarsa.")
-    item = items[index]
-    try:
-        soup = await asyncio.to_thread(_fetch_lk21, item["link"])
-    except Exception as e:
-        return await cinema_edit(target, f"❌ Gagal membuka detail: {clean(str(e))}",
-                                 [[Button.inline("⬅️ Kembali", b"cin:back"),
-                                   Button.inline("🏠 Cinema", b"cin:home")]])
-
-    synopsis_tag = soup.find("div", class_="synopsis") or soup.find("div", class_="entry-content")
-    synopsis = synopsis_tag.get_text(" ", strip=True) if synopsis_tag else "Sinopsis belum tersedia."
-    if len(synopsis) > 400:
-        synopsis = synopsis[:400] + "..."
-
-    lines = [f"🎬 **{clean(item['title'])}**", "━━━━━━━━━━━━━━━━━━",
-             f"**Sinopsis:**\n{clean(synopsis)}"]
-
-    buttons = []
-    meta_redirect = soup.find("meta", attrs={"http-equiv": re.compile("refresh", re.I)})
-    content = (meta_redirect.get("content", "") if meta_redirect else "")
-    if "url=" in content.lower():
-        target_url = re.split(r"url=", content, flags=re.I)[-1].strip().strip("'\"")
-        target_url = urllib.parse.urljoin(LK21_BASE_URL + "/", target_url)
-        buttons.append(Button.url("🌐 Buka di Nontondrama", target_url))
-        lines.append("\n*(Ini adalah Series. Silakan buka link di atas untuk memilih episode)*")
-    else:
-        stream_url = None
-        for f in soup.find_all("iframe"):
-            src = f.get("src") or f.get("data-src") or ""
-            if not src:
-                continue
-            s = urllib.parse.urljoin(item["link"], src)
-            if s.startswith("http") and not re.search(r"youtube|youtu\.be|ads|doubleclick", s, re.I):
-                stream_url = s
-                break
-        if stream_url:
-            item["stream_url"] = stream_url
-            buttons.append(Button.inline("▶ Putar di VC", f"cin:play:{index}".encode()))
-            buttons.append(Button.url("🌐 Buka Player", stream_url))
-        else:
-            lines.append("\n❌ Link streaming tidak ditemukan di halaman ini.")
-            buttons.append(Button.url("🌐 Buka Halaman", item["link"]))
-
-    buttons.append(Button.inline("⬅️ Kembali", b"cin:back"))
-    buttons.append(Button.inline("🏠 Cinema", b"cin:home"))
-    keyboard = [buttons[i:i + 2] for i in range(0, len(buttons), 2)]
-    return await cinema_edit(target, "\n".join(lines), keyboard)
-
-
-async def cinema_play(event, chat_id, index):
-    err = need_vc()
-    if err:
-        return await event.answer(toast(err), alert=True)
-
-    items = CINEMA_ITEMS.get(chat_id, [])
-    if not (0 <= index < len(items)) or "stream_url" not in items[index]:
-        return await event.answer("Daftar kedaluwarsa, buka detail lagi.", alert=True)
-
-    item = items[index]
-    stream_url = item["stream_url"]
-    await event.answer("⏳ Mengambil link video... tunggu sebentar")
-
-    # Coba 1: yt-dlp (bisa menembus beberapa embed player)
-    song, e = await asyncio.to_thread(
-        resolve_song, {"page": stream_url, "title": item["title"], "source": "LK21",
-                       "video": True, "keep_title": True})
-
-    # Coba 2: scraper cadangan
-    if not song:
-        print(f"yt-dlp gagal untuk {stream_url}: {e}. Mencoba scraper cadangan...")
-        res = await asyncio.to_thread(_scrape_stream, stream_url)
-        if res:
-            real_url, referer = res
-            song = {
-                "url": real_url, "page": stream_url, "title": item["title"],
-                "duration": 0, "source": "LK21", "video": True,
-                "force_audio": VIDEO_HEIGHT == 0,
-                "headers": {"User-Agent": UA, "Referer": referer},
-            }
-        else:
-            return await manager_bot.send_message(
-                chat_id,
-                f"❌ Gagal memutar video.\nError: {clean(e)}\n\n"
-                "Coba tombol 'Buka Player' untuk menonton di browser.")
-
-    song["duration"] = await probe_duration(song["url"], song.get("headers")) or song.get("duration", 0)
-    text = await do_enqueue(song)
-    await manager_bot.send_message(chat_id, text, buttons=ctrl_buttons())
-
-
-async def cinema_callback(event):
-    data = event.data.decode("utf-8", "ignore")
-    chat_id = event.chat_id
-    try:
-        if data.startswith("cin:play:"):
-            return await cinema_play(event, chat_id, int(data.split(":")[2]))
-        await event.answer()
-        if data == "cin:home":
-            return await cinema_edit(event, cinema_home_text(), cinema_home_buttons())
-        if data == "cin:search":
-            return await cinema_edit(event, "🔎 Gunakan `/csearch judul film`",
-                                     [[Button.inline("🏠 Cinema", b"cin:home")]])
-        if data.startswith("cin:detail:"):
-            return await cinema_detail(event, chat_id, int(data.split(":")[2]))
-        if data == "cin:back":
-            v = CINEMA_VIEW.get(chat_id, {})
-            if v.get("type") == "search":
-                return await cinema_search_list(event, chat_id, v.get("query", ""))
-            return await cinema_edit(event, cinema_home_text(), cinema_home_buttons())
-    except Exception as e:
-        try:
-            await event.edit(f"⚠️ Cinema: {clean(str(e))[:250]}",
-                             buttons=[[Button.inline("🏠 Cinema", b"cin:home")]])
-        except Exception:
-            pass
-
-
-# ==========================================
-# GETLINK: ambil link video (.m3u8 / .mp4) lewat browser sungguhan (Playwright)
-# ==========================================
-MEDIA_RE = re.compile(r"\.(?:m3u8|mp4)(?:\?|$)", re.I)
-AD_RE = re.compile(r"doubleclick|googlesyndication|adsystem|adservice|/ads?/|popads|propeller|exoclick", re.I)
-CF_TITLE_RE = re.compile(r"just a moment|attention required|checking your browser|sebentar", re.I)
-GETLINKS = {}   # chat_id -> {"title": str, "links": [{"url":..., "headers": {...}}]}
-GETLINK_LOCK = asyncio.Lock()
-
-
-async def grab_links(page_url, wait=40):
-    """Buka halaman di Chromium dan tangkap request .m3u8/.mp4. Return (links, title, error)."""
-    try:
-        from playwright.async_api import async_playwright
-    except ImportError:
-        return [], "", ("Playwright belum terpasang. Tambah 'playwright' di requirements.txt "
-                        "dan langkah install Chromium di workflow.")
-
-    found = {}
-    title = ""
-    err = None
-    try:
-        async with async_playwright() as p:
-            browser = await p.chromium.launch(
-                headless=True,
-                args=["--no-sandbox", "--disable-dev-shm-usage",
-                      "--disable-blink-features=AutomationControlled",
-                      "--autoplay-policy=no-user-gesture-required"])
-            try:
-                ctx = await browser.new_context(
-                    user_agent=UA, locale="id-ID", viewport={"width": 1280, "height": 720})
-                await ctx.add_init_script(
-                    "Object.defineProperty(navigator,'webdriver',{get:()=>undefined});")
-                page = await ctx.new_page()
-
-                def on_request(req):
-                    u = req.url
-                    if MEDIA_RE.search(u) and not AD_RE.search(u) and u not in found:
-                        h = req.headers or {}
-                        found[u] = {"Referer": h.get("referer") or page_url,
-                                    "User-Agent": h.get("user-agent") or UA}
-
-                def on_popup(pg):
-                    asyncio.ensure_future(pg.close())  # tutup iklan pop-up
-
-                ctx.on("request", on_request)
-                ctx.on("page", on_popup)
-
-                await page.goto(page_url, wait_until="domcontentloaded", timeout=45000)
-
-                for _ in range(max(1, wait // 2)):
-                    if found:
-                        break
-                    try:
-                        t = await page.title()
-                    except Exception:
-                        t = ""
-                    if CF_TITLE_RE.search(t or ""):   # masih tantangan Cloudflare, tunggu
-                        await asyncio.sleep(2)
-                        continue
-                    try:
-                        await page.mouse.click(640, 360)   # pancing tombol play
-                    except Exception:
-                        pass
-                    for fr in page.frames:
-                        try:
-                            await fr.evaluate(
-                                "() => { const v = document.querySelector('video');"
-                                " if (v) { v.muted = true; v.play().catch(() => {}); } }")
-                        except Exception:
-                            pass
-                    await asyncio.sleep(2)
-
-                try:
-                    title = await page.title()
-                except Exception:
-                    title = ""
-
-                if not found:   # cadangan: baca src <video> langsung
-                    for fr in page.frames:
-                        try:
-                            src = await fr.evaluate(
-                                "() => { const v = document.querySelector('video');"
-                                " return v ? (v.currentSrc || v.src || '') : ''; }")
-                        except Exception:
-                            src = ""
-                        if src.startswith("http") and not AD_RE.search(src):
-                            found[src] = {"Referer": page_url, "User-Agent": UA}
-
-                if not found and CF_TITLE_RE.search(title or ""):
-                    err = ("Cloudflare masih menahan browser juga "
-                           "(IP server GitHub kemungkinan diblokir).")
-            finally:
-                await browser.close()
-    except Exception as e:
-        err = f"{type(e).__name__}: {str(e)[:150]}"
-
-    links = [{"url": u, "headers": h} for u, h in found.items()]
-    links.sort(key=lambda x: 0 if ".m3u8" in x["url"].lower() else 1)
-    return links[:4], title, err
-
-
-async def getlink_play(event, idx):
-    st = GETLINKS.get(event.chat_id)
-    if not st or not (0 <= idx < len(st["links"])):
-        return await event.answer("Daftar kedaluwarsa, jalankan /getlink lagi.", alert=True)
-    err = need_vc()
-    if err:
-        return await event.answer(toast(err), alert=True)
-    await event.answer("⏳ Menyiapkan...")
-    l = st["links"][idx]
-    dur = await probe_duration(l["url"], l["headers"])
-    song = {
-        "url": l["url"], "page": l["url"], "title": st["title"], "duration": dur,
-        "source": "GetLink", "video": True, "force_audio": VIDEO_HEIGHT == 0,
-        "headers": l["headers"], "fmt": "hls" if ".m3u8" in l["url"].lower() else "mp4",
-    }
-    text = await do_enqueue(song)
-    await manager_bot.send_message(event.chat_id, text, buttons=ctrl_buttons())
 
 
 # ==========================================
@@ -940,12 +440,11 @@ async def play_next(chat_id):
             await call_any(["unmute", "unmute_stream"], chat_id)
         except Exception:
             pass
-        print(f"▶ Memutar: {song['title']} | {song.get('source')} {song.get('fmt')}")
+        print(f"▶️ Memutar: {song['title']} | {song.get('source')} {song.get('fmt')}")
         if song.get("duration"):
             schedule_next(chat_id, song, song["duration"] + 2)
     except Exception as e:
         print(f"Error playing: {e}")
-        PLAY_ERRORS[chat_id] = str(e)[:150]
         await play_next(chat_id)
 
 
@@ -958,13 +457,9 @@ async def do_enqueue(song, now=False):
     if song.get("video"):
         tag = " 🎬" + tag
     if now or idle:
-        PLAY_ERRORS.pop(chat_id, None)
         q.insert(0, song)
         await play_next(chat_id)
-        perr = PLAY_ERRORS.pop(chat_id, None)
-        if perr:
-            return f"❌ Gagal memutar {clean(song['title'])}: {clean(perr)}"
-        return f"▶ **Memutar:** {clean(song['title'])}{tag}"
+        return f"▶️ **Memutar:** {clean(song['title'])}{tag}"
     q.append(song)
     return f"➕ **Antrean #{len(q)}:** {clean(song['title'])}{tag}"
 
@@ -973,7 +468,7 @@ async def do_enqueue(song, now=False):
 # AKSI KONTROL (dipakai perintah dan tombol)
 # ==========================================
 NO_USERBOT = "❌ Userbot belum online. Owner: kirim file zip session ke bot ini."
-NO_VC = "❌ VC belum diset. Owner: /setvc @usernamegrup."
+NO_VC = "❌ VC belum diset. Owner: `/setvc @usernamegrup`."
 
 
 def need_vc():
@@ -1008,7 +503,7 @@ async def act_resume():
         song = current_songs.get(TARGET_VC_ID)
         if song and song.get("duration") and "left" in song and TARGET_VC_ID not in timers:
             schedule_next(TARGET_VC_ID, song, song["left"])
-        return "▶ Dilanjutkan."
+        return "▶️ Dilanjutkan."
     except Exception as ex:
         return f"❌ Gagal: {ex}"
 
@@ -1119,7 +614,7 @@ def panel_text():
     cur = current_songs.get(TARGET_VC_ID) if TARGET_VC_ID else None
     now = clean(cur["title"]) if cur and cur["title"] != "Silent" else "—"
     ub = "🟢 Online" if userbot_call else "🔴 Offline"
-    vc = f"{TARGET_VC_ID}" if TARGET_VC_ID else "belum diset"
+    vc = f"`{TARGET_VC_ID}`" if TARGET_VC_ID else "belum diset"
     qn = len(get_queue(TARGET_VC_ID)) if TARGET_VC_ID else 0
     return (
         "🎵 **Music Panel**\n\n"
@@ -1127,13 +622,13 @@ def panel_text():
         f"Sedang main: {now}\nAntrean: {qn} lagu\n\n"
         f"🧹 Filter: {'ON' if FILTER_ON else 'OFF'}   🔁 Loop: {'ON' if LOOP else 'OFF'}\n"
         f"📺 Video: {quality_label()}{' 💡hemat' if HEMAT_ON else ''}\n\n"
-        "Cari lagu: /play judul\nNonton: /vplay judul atau /vplay link\nCinema: /cinema"
+        "Cari lagu: `/play judul`\nNonton: `/vplay judul` atau `/vplay link`"
     )
 
 
 def ctrl_buttons():
     return [
-        [Button.inline("⏸", b"pause"), Button.inline("▶", b"resume"),
+        [Button.inline("⏸", b"pause"), Button.inline("▶️", b"resume"),
          Button.inline("⏭", b"skip"), Button.inline("⏹", b"stop")],
         [Button.inline("🎶 Now", b"np"), Button.inline("📜 Antrean", b"queue"),
          Button.inline("🔁 Loop", b"loop")],
@@ -1141,12 +636,12 @@ def ctrl_buttons():
 
 
 def panel_buttons(uid):
-    return ctrl_buttons() + [
+    rows = ctrl_buttons() + [
         [Button.inline("🧹 Filter", b"filter"), Button.inline("💡 Hemat", b"hemat"),
          Button.inline("🔄 Refresh", b"refresh")],
-        [Button.inline("🎬 Cinema Center", b"cin:home")],
         [Button.inline("👥 Admin", b"admins")],
     ]
+    return rows
 
 
 def queue_text():
@@ -1173,12 +668,12 @@ def queue_buttons():
 
 
 def admins_text():
-    lines = [f"👑 Owner: {OWNER_ID}"]
+    lines = [f"👑 Owner: `{OWNER_ID}`"]
     for uid, name in DATA["admins"].items():
-        lines.append(f"• {clean(name)} ({uid})")
+        lines.append(f"• {clean(name)} (`{uid}`)")
     if len(lines) == 1:
         lines.append("(belum ada admin tambahan)")
-    lines.append("\nTambah: /addadmin ID atau minta orangnya kirim /start ke bot ini.")
+    lines.append("\nTambah: `/addadmin ID` atau minta orangnya kirim /start ke bot ini.")
     return "👥 **Daftar Admin**\n\n" + "\n".join(lines)
 
 
@@ -1228,7 +723,7 @@ async def show_results(chat_id, query, results, video):
     for i, r in enumerate(results):
         ch = f"{clean(r['channel'])} • " if r.get("channel") else ""
         cap = f"**{i + 1}. {clean(r['title'])}**\n{ch}{fmt_dur(r['duration'])} • {r['source']}"
-        btns = [[Button.inline("▶ Putar", f"pick:{i}".encode()),
+        btns = [[Button.inline("▶️ Putar", f"pick:{i}".encode()),
                  Button.inline("➕ Antre", f"add:{i}".encode())]]
         msg = None
         if r.get("thumb"):
@@ -1239,8 +734,7 @@ async def show_results(chat_id, query, results, video):
         if msg is None:
             msg = await manager_bot.send_message(chat_id, cap, buttons=btns)
         mids.append(msg.id)
-    tail = await manager_bot.send_message(
-        chat_id, "Pilih salah satu 👆", buttons=[[Button.inline("❌ Tutup", b"close")]])
+    tail = await manager_bot.send_message(chat_id, "Pilih salah satu 👆", buttons=[[Button.inline("❌ Tutup", b"close")]])
     mids.append(tail.id)
     PENDING[chat_id] = {"results": results, "mids": mids}
 
@@ -1327,7 +821,7 @@ def arg_of(event):
 
 async def deny(event):
     await event.reply(
-        f"⛔ **Kamu belum jadi admin.**\nID kamu: {event.sender_id}",
+        f"⛔ **Kamu belum jadi admin.**\nID kamu: `{event.sender_id}`",
         buttons=[[Button.inline("🙋 Minta akses ke owner", b"req")]],
     )
 
@@ -1356,38 +850,15 @@ async def c_start(event):
 async def c_help(event):
     await event.reply(
         "📖 **Perintah**\n\n"
-        "/play judul|link - cari lagu (ada gambar + tombol)\n"
-        "/fast judul - langsung putar hasil teratas\n"
-        "/vplay judul|link - nonton (share screen)\n"
-        "/playurl url - audio dari link apa saja\n"
-        "/vplayurl url - video dari link apa saja\n"
-        "/np /queue /pause /resume /skip /stop\n"
-        "/loop /shuffle /clear /remove N\n"
-        "/filter /hemat [144|240|360] /quality audio|144..720\n"
-        "/cinema /csearch judul - film LK21\n"
-        "/getlink url - cari link video di halaman (browser)\n"
-        "/admins /status\n\n"
-        "**Owner:** /setvc @grup /unsetvc /addadmin ID /deladmin ID /getsession /amode"
+        "`/play judul` - cari lagu (ada gambar + tombol)\n"
+        "`/fast judul` - langsung putar hasil teratas\n"
+        "`/vplay judul|link` - nonton (share screen)\n"
+        "`/np` `/queue` `/pause` `/resume` `/skip` `/stop`\n"
+        "`/loop` `/shuffle` `/clear` `/remove N`\n"
+        "`/filter` `/hemat [144|240|360]` `/quality audio|144..720`\n"
+        "`/admins` `/status`\n\n"
+        "**Owner:** `/setvc @grup` `/unsetvc` `/addadmin ID` `/deladmin ID` `/getsession`"
     )
-
-
-@cmd(r"^/cinema(?:\s|$)")
-async def cinema_command(event):
-    CINEMA_VIEW[event.chat_id] = {"type": "home"}
-    await event.reply(cinema_home_text(), buttons=cinema_home_buttons(), link_preview=False)
-
-
-@cmd(r"^/csearch(?:\s|$)")
-async def cinema_search_command(event):
-    q = arg_of(event)
-    if not q:
-        return await event.reply("Cara mencari: `/csearch judul film`",
-                                 buttons=[[Button.inline("🏠 Cinema", b"cin:home")]])
-    status = await event.reply("🔎 Mencari di LK21...")
-    try:
-        await cinema_search_list(status, event.chat_id, q)
-    except Exception as e:
-        await status.edit(f"⚠️ Error: {clean(str(e))}", buttons=[[Button.inline("🏠 Cinema", b"cin:home")]])
 
 
 @cmd(r"^/setvc(?:\s|$)", owner=True)
@@ -1398,8 +869,8 @@ async def c_setvc(event):
     raw = arg_of(event)
     if not raw:
         return await event.reply(
-            "**Usage:**\n/setvc @usernamegrup\n/setvc https://t.me/usernamegrup\n"
-            "/setvc -5240836914\n/setvc https://t.me/+kodeundangan (grup privat)")
+            "**Usage:**\n`/setvc @usernamegrup`\n`/setvc https://t.me/usernamegrup`\n"
+            "`/setvc -5240836914`\n`/setvc https://t.me/+kodeundangan` (grup privat)")
     m = await event.reply("⏳ Mencoba masuk VC...")
     try:
         chat_id = await resolve_chat(userbot_app, raw)
@@ -1412,16 +883,16 @@ async def c_setvc(event):
                                 config=GroupCallConfig(auto_start=True))
         TARGET_VC_ID = chat_id
         current_songs[chat_id] = silent_song()
-        await m.edit(f"✅ **Target VC diset!**\nID: {chat_id}\nSilakan /play judul.",
+        await m.edit(f"✅ **Target VC diset!**\nID: `{chat_id}`\nSilakan `/play judul`.",
                      buttons=[[Button.inline("🎛 Panel", b"refresh")]])
     except Exception as e:
         hint = (
-            "Akun belum 'mengenal' grup ini. Pakai @usernamegrup atau link grup. "
-            "Grup privat: link undangan t.me/+...."
+            "Akun belum 'mengenal' grup ini. Pakai `@usernamegrup` atau link grup. "
+            "Grup privat: link undangan `t.me/+...`."
             if "input entity" in str(e) or "Cannot find any entity" in str(e)
             else "Cek: VC grup sedang aktif, dan ID/username benar."
         )
-        await m.edit(f"❌ Gagal masuk: {e}\n{hint}")
+        await m.edit(f"❌ Gagal masuk: `{e}`\n{hint}")
 
 
 @cmd(r"^/unsetvc(?:\s|$)", owner=True)
@@ -1446,11 +917,11 @@ async def c_play(event):
         return await event.reply(err)
     q = arg_of(event)
     if not q:
-        return await event.reply("**Usage:** /play judul lagu atau /play link")
+        return await event.reply("**Usage:** `/play judul lagu` atau `/play link`")
     m = await event.reply("🔎 Mencari...")
     if q.startswith("http"):
-        song, e = await asyncio.to_thread(
-            resolve_song, {"page": q, "title": q, "source": detect_source(q)})
+        src = "SoundCloud" if "soundcloud" in q else "YouTube"
+        song, e = await asyncio.to_thread(resolve_song, {"page": q, "title": q, "source": src})
         if not song:
             return await m.edit(f"❌ Gagal ambil audio.\n{clean(e)}")
         return await m.edit(await do_enqueue(song), buttons=ctrl_buttons())
@@ -1468,7 +939,7 @@ async def c_fast(event):
         return await event.reply(err)
     q = arg_of(event)
     if not q:
-        return await event.reply("**Usage:** /fast judul lagu")
+        return await event.reply("**Usage:** `/fast judul lagu`")
     m = await event.reply("🔎 Mencari...")
     results, e = await asyncio.to_thread(search_candidates, q)
     if not results:
@@ -1486,11 +957,11 @@ async def c_vplay(event):
         return await event.reply(err)
     q = arg_of(event)
     if not q:
-        return await event.reply("**Usage:** /vplay judul atau /vplay link")
+        return await event.reply("**Usage:** `/vplay judul` atau `/vplay link`")
     m = await event.reply("🔎 Mencari video...")
     if q.startswith("http"):
         song, e = await asyncio.to_thread(
-            resolve_song, {"page": q, "title": q, "source": detect_source(q), "video": True})
+            resolve_song, {"page": q, "title": q, "source": "YouTube", "video": True})
         if not song:
             return await m.edit(f"❌ Gagal ambil video.\n{clean(e)}")
         return await m.edit(await do_enqueue(song), buttons=ctrl_buttons())
@@ -1504,68 +975,6 @@ async def c_vplay(event):
         r["video"] = True
     await m.delete()
     await show_results(event.chat_id, q, results, video=True)
-
-
-@cmd(r"^/playurl(?:\s|$)")
-async def c_playurl(event):
-    err = need_vc()
-    if err:
-        return await event.reply(err)
-    url = arg_of(event)
-    if not url.startswith("http"):
-        return await event.reply("**Usage:** /playurl https://...")
-    m = await event.reply("🔎 Mengekstrak stream...")
-    song, e = await asyncio.to_thread(
-        resolve_song, {"page": url, "title": url, "source": detect_source(url)})
-    if not song:
-        return await m.edit(f"❌ Gagal: {clean(e)}")
-    await m.edit(await do_enqueue(song), buttons=ctrl_buttons())
-
-
-@cmd(r"^/vplayurl(?:\s|$)")
-async def c_vplayurl(event):
-    err = need_vc()
-    if err:
-        return await event.reply(err)
-    url = arg_of(event)
-    if not url.startswith("http"):
-        return await event.reply("**Usage:** /vplayurl https://...")
-    m = await event.reply("🔎 Mengekstrak video...")
-    song, e = await asyncio.to_thread(
-        resolve_song, {"page": url, "title": url, "source": detect_source(url), "video": True})
-    if not song:
-        return await m.edit(f"❌ Gagal: {clean(e)}")
-    await m.edit(await do_enqueue(song), buttons=ctrl_buttons())
-
-
-@cmd(r"^/getlink(?:\s|$)")
-async def c_getlink(event):
-    url = arg_of(event)
-    if not url.startswith("http"):
-        return await event.reply(
-            "**Usage:** /getlink https://halaman-film...\n"
-            "Bot membuka halaman di browser dan mencari link video (.m3u8/.mp4).")
-    if GETLINK_LOCK.locked():
-        return await event.reply("⏳ Masih ada proses /getlink lain, tunggu sebentar.")
-    m = await event.reply("🌐 Membuka halaman di browser... (bisa 30-60 detik)")
-    async with GETLINK_LOCK:
-        try:
-            links, title, err = await asyncio.wait_for(grab_links(url), 100)
-        except asyncio.TimeoutError:
-            links, title, err = [], "", "Waktu habis."
-    if not links:
-        return await m.edit(
-            f"❌ Link video tidak ketemu.\n{clean(err or 'Tidak ada request video terdeteksi.')}")
-    name = clean(title)[:60] or "Video"
-    GETLINKS[event.chat_id] = {"title": name, "links": links}
-    lines = [f"🔗 **Link ditemukan** ({len(links)})", name, ""]
-    rows = []
-    for i, l in enumerate(links):
-        u = l["url"] if len(l["url"]) <= 250 else l["url"][:247] + "..."
-        lines.append(f"{i + 1}. `{u}`")
-        rows.append([Button.inline(f"▶ Putar #{i + 1}", f"gl:play:{i}".encode())])
-    lines.append("\nTombol Putar paling aman (membawa header Referer). Link juga bisa dipakai: /vplayurl link")
-    await m.edit("\n".join(lines), buttons=rows, link_preview=False)
 
 
 @cmd(r"^/np(?:\s|$)")
@@ -1617,7 +1026,7 @@ async def c_clear(event):
 async def c_remove(event):
     a = arg_of(event)
     if not a.isdigit():
-        return await event.reply("**Usage:** /remove 2")
+        return await event.reply("**Usage:** `/remove 2`")
     await event.reply(await act_remove(int(a)))
 
 
@@ -1640,8 +1049,7 @@ async def c_quality(event):
 async def c_amode(event):
     global AUDIO_PLAIN
     AUDIO_PLAIN = not AUDIO_PLAIN
-    await event.reply(
-        f"🔊 Mode audio: {'BIASA' if AUDIO_PLAIN else 'AUDIO-ONLY'}. Putar ulang untuk mencoba.")
+    await event.reply(f"🔊 Mode audio: {'BIASA' if AUDIO_PLAIN else 'AUDIO-ONLY'}. Putar ulang untuk mencoba.")
 
 
 @cmd(r"^/admins(?:\s|$)")
@@ -1653,7 +1061,7 @@ async def c_admins(event):
 async def c_addadmin(event):
     a = arg_of(event)
     if not a:
-        return await event.reply("**Usage:** /addadmin 123456789 atau /addadmin @username")
+        return await event.reply("**Usage:** `/addadmin 123456789` atau `/addadmin @username`")
     try:
         if a.lstrip("-").isdigit():
             uid = int(a)
@@ -1667,12 +1075,12 @@ async def c_addadmin(event):
             uid = ent.id
             name = utils.get_display_name(ent) or a
     except Exception as e:
-        return await event.reply(f"❌ Tidak bisa menemukan user: {e}\nPakai ID angka.")
+        return await event.reply(f"❌ Tidak bisa menemukan user: `{e}`\nPakai ID angka.")
     if uid == OWNER_ID:
         return await event.reply("Itu kamu sendiri, owner sudah punya semua akses.")
     DATA["admins"][str(uid)] = name
     await save_data()
-    await event.reply(f"✅ **{clean(name)}** ({uid}) sekarang admin.")
+    await event.reply(f"✅ **{clean(name)}** (`{uid}`) sekarang admin.")
     try:
         await manager_bot.send_message(uid, "✅ Kamu sekarang admin Music Bot. Ketik /start.")
     except Exception:
@@ -1683,7 +1091,7 @@ async def c_addadmin(event):
 async def c_deladmin(event):
     a = arg_of(event)
     if not a.lstrip("-").isdigit() or str(int(a)) not in DATA["admins"]:
-        return await event.reply("**Usage:** /deladmin ID (lihat /admins).")
+        return await event.reply("**Usage:** `/deladmin ID` (lihat `/admins`).")
     name = DATA["admins"].pop(str(int(a)))
     await save_data()
     await event.reply(f"🗑 {clean(name)} dihapus dari admin.")
@@ -1696,8 +1104,8 @@ async def c_getsession(event):
     s = StringSession.save(userbot_app.session)
     m = await event.reply(
         "🔑 **SESSION_STRING** (rahasia, setara password akun!)\n\n"
-        f"{s}\n\n"
-        "Simpan di GitHub Secrets dengan nama SESSION_STRING, supaya userbot nyala otomatis "
+        f"`{s}`\n\n"
+        "Simpan di GitHub Secrets dengan nama `SESSION_STRING`, supaya userbot nyala otomatis "
         "tanpa upload zip. Pesan ini terhapus otomatis dalam 90 detik.")
     await asyncio.sleep(90)
     try:
@@ -1716,9 +1124,7 @@ async def c_status(event):
         f"VC: {TARGET_VC_ID or 'belum diset'}\n"
         f"Admin: {len(DATA['admins'])} + owner\n"
         f"Cookies: {'ada' if os.path.exists(COOKIES) else 'tidak ada'}\n"
-        f"Penyimpanan: {'sinkron' if not DATA_DIRTY else 'belum tersimpan (menunggu userbot)'}\n"
-        f"Cinema: {LK21_BASE_URL}\n"
-        f"Anti-403: {'curl_cffi aktif' if IMPERSONATE else 'tidak aktif (pasang curl_cffi)'}"
+        f"Penyimpanan: {'sinkron' if not DATA_DIRTY else 'belum tersimpan (menunggu userbot)'}"
     )
 
 
@@ -1726,7 +1132,7 @@ async def c_status(event):
 # TOMBOL (CALLBACK)
 # ==========================================
 def toast(text):
-    return re.sub(r"[*_]", "", text)[:190]
+    return re.sub(r"[*_`]", "", text)[:190]
 
 
 async def refresh_panel(event):
@@ -1773,7 +1179,7 @@ async def on_callback(event):
         try:
             await manager_bot.send_message(
                 OWNER_ID,
-                f"🙋 Permintaan akses admin\nNama: {clean(name)}\nUsername: {uname}\nID: {uid}",
+                f"🙋 **Permintaan akses admin**\nNama: {clean(name)}\nUsername: {uname}\nID: `{uid}`",
                 buttons=[[Button.inline("✅ Setujui", f"appr:{uid}".encode()),
                           Button.inline("❌ Tolak", f"rej:{uid}".encode())]],
             )
@@ -1784,14 +1190,6 @@ async def on_callback(event):
 
     if not is_admin(uid):
         return await event.answer("⛔ Kamu bukan admin.", alert=True)
-
-    # --- Cinema (khusus admin) ---
-    if data.startswith("cin:"):
-        return await cinema_callback(event)
-
-    # --- GetLink ---
-    if data.startswith("gl:play:"):
-        return await getlink_play(event, int(data.split(":")[2]))
 
     # --- khusus owner ---
     if data.startswith(("appr:", "rej:", "deladm:")):
@@ -1805,7 +1203,7 @@ async def on_callback(event):
             ASKED.discard(tid)
             await save_data()
             try:
-                await event.edit(f"✅ {clean(name)} ({tid}) disetujui jadi admin.")
+                await event.edit(f"✅ {clean(name)} (`{tid}`) disetujui jadi admin.")
             except Exception:
                 pass
             try:
@@ -1816,7 +1214,7 @@ async def on_callback(event):
             REQUESTS.pop(tid, None)
             ASKED.discard(tid)
             try:
-                await event.edit(f"❌ Permintaan {tid} ditolak.")
+                await event.edit(f"❌ Permintaan `{tid}` ditolak.")
             except Exception:
                 pass
             try:
@@ -1894,12 +1292,12 @@ async def on_document(event):
         if hasattr(a, "file_name"):
             name = a.file_name or ""
     if not name.lower().endswith(".zip"):
-        return await event.reply("❌ Kirim file .zip yang berisi file .session.")
+        return await event.reply("❌ Kirim file `.zip` yang berisi file `.session`.")
 
     msg = await event.reply("⏳ Memproses file...")
     zip_path = await event.download_media()
     try:
-        extract_dir = os.path.join(TMP_DIR, "session_extract")
+        extract_dir = "/tmp/session_extract"
         if os.path.exists(extract_dir):
             shutil.rmtree(extract_dir)
         os.makedirs(extract_dir)
@@ -1909,22 +1307,22 @@ async def on_document(event):
 
         found = glob.glob(f"{extract_dir}/**/*.session", recursive=True)
         if not found:
-            return await msg.edit("❌ File .session tidak ditemukan di dalam zip!")
-        for f in glob.glob(SESSION_BASE + ".session*"):
+            return await msg.edit("❌ File `.session` tidak ditemukan di dalam zip!")
+        for f in glob.glob("/tmp/userbot_session.session*"):
             os.remove(f)
-        shutil.move(found[0], SESSION_BASE + ".session")
+        shutil.move(found[0], "/tmp/userbot_session.session")
 
         await msg.edit("✅ Session ditemukan.\n⏳ Menyalakan userbot...")
-        await boot_userbot(SESSION_BASE)
+        await boot_userbot("/tmp/userbot_session")
         await msg.edit(
-            "🚀 Userbot online!\n\n"
-            "1. /setvc @usernamegrup\n2. /play judul\n\n"
-            "Tips: ketik /getsession lalu simpan di Secrets SESSION_STRING "
+            "🚀 **Userbot online!**\n\n"
+            "1. `/setvc @usernamegrup`\n2. `/play judul`\n\n"
+            "Tips: ketik `/getsession` lalu simpan di Secrets `SESSION_STRING` "
             "supaya tidak perlu upload zip lagi setiap restart.",
             buttons=[[Button.inline("🎛 Panel", b"refresh")]],
         )
     except Exception as e:
-        await msg.edit(f"❌ Gagal:\n{e}")
+        await msg.edit(f"❌ **Gagal:**\n`{e}`")
 
 
 # ==========================================
@@ -1944,9 +1342,9 @@ async def main():
     if SESSION_STRING:
         try:
             await boot_userbot(StringSession(SESSION_STRING))
-            await notify_owner("🚀 Bot restart. Userbot online otomatis.\n/start untuk panel, lalu /setvc.")
+            await notify_owner("🚀 Bot restart. Userbot **online otomatis**.\n/start untuk panel, lalu `/setvc`.")
         except Exception as e:
-            await notify_owner(f"❌ Auto-start userbot gagal: {e}\nKirim file zip session secara manual.")
+            await notify_owner(f"❌ Auto-start userbot gagal: `{e}`\nKirim file zip session secara manual.")
     else:
         await notify_owner("🤖 Bot nyala. Kirim file zip session untuk menyalakan userbot.")
     await manager_bot.run_until_disconnected()
