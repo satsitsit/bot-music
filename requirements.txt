@@ -1,7 +1,3 @@
 telethon
 py-tgcalls
 yt-dlp[default]
-requests
-beautifulsoup4
-curl_cffi
-playwright
