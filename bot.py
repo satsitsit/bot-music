@@ -1,3 +1,5 @@
+# ENV wajib   : API_ID, API_HASH, BOT_TOKEN, OWNER_ID
+# ENV opsional: SESSION_STRING, FILM_BOT_ALLOW (username bot film yang diizinkan, pisahkan koma)
 import asyncio
 import glob
 import hashlib
@@ -32,11 +34,24 @@ from pytgcalls.types import MediaStream, GroupCallConfig
 def _env(name, default=""):
     return os.environ.get(name) or default
 
-API_ID = int(_env("API_ID", "32333215"))
-API_HASH = _env("API_HASH", "3d9a1c2ab47d6a7b6fff1b452ab22452")
-BOT_TOKEN = _env("BOT_TOKEN", "9183135814:AAFpb7Q9MZwu46edK1ME7sL5FR690ydIDwg")
-OWNER_ID = int(_env("OWNER_ID", "8962307609"))
+
+def _need(name):
+    v = _env(name)
+    if not v:
+        raise SystemExit(f"❌ Environment variable {name} belum diisi. "
+                         "Isi lewat environment / GitHub Secrets (jangan ditulis di kode).")
+    return v
+
+
+API_ID = int(_need("API_ID"))
+API_HASH = _need("API_HASH")
+BOT_TOKEN = _need("BOT_TOKEN")
+OWNER_ID = int(_need("OWNER_ID"))
 SESSION_STRING = _env("SESSION_STRING")
+
+# Opsional: batasi bot film yang boleh dihubungi userbot, contoh: "BotA,BotB"
+FILM_BOT_ALLOW = {x.strip().lstrip("@").lower() for x in _env("FILM_BOT_ALLOW").split(",") if x.strip()}
+DL_WAIT_MAX = 3 * 3600   # batas maksimal menunggu unduhan film sebelum dilewati
 
 SILENT_AUDIO = "https://github.com/anars/blank-audio/raw/master/1-second-of-silence.mp3"
 COOKIES = "cookies.txt"
@@ -46,8 +61,8 @@ FILM_EXT = (".mp4", ".mkv", ".webm", ".mov", ".avi", ".m4v")
 os.makedirs(FILM_DIR, exist_ok=True)
 
 # ---- HASIL PENCARIAN ----
-MAX_RESULTS = 15      
-PAGE_SIZE = 5         
+MAX_RESULTS = 15
+PAGE_SIZE = 5
 
 # ---- FILTER LAGU ----
 FILTER_ON = True
@@ -76,13 +91,13 @@ VIDEO_SIZES = {
 FIRST_PLAY_RETRY = True
 AUDIO_PLAIN = True
 LOOP = False
-SAVE_DELAY = 20       
-PLAYLIST_MAX = 25     
+SAVE_DELAY = 20
+PLAYLIST_MAX = 25
 FAV_MAX = 30
 HIST_MAX = 15
 QUEUE_SAVE_MAX = 30
 VOLUME = 100
-AUTO_CLEAN = True     
+AUTO_CLEAN = True
 
 START_TIME = time.time()
 manager_bot = TelegramClient(MemorySession(), API_ID, API_HASH)
@@ -97,20 +112,20 @@ TARGET_VC_ID = None
 queues = {}
 current_songs = {}
 timers = {}
-PENDING = {}        
-PANELS = {}         
-VIEW = {}           
+PENDING = {}
+PANELS = {}
+VIEW = {}
 REQUESTS = {}
 ASKED = set()
-LISTPAGE = {}      
+LISTPAGE = {}
 SLEEP = {"task": None, "until": 0}
 LAST_SAVED = b""
 _save_task = None
-PLAY_GEN = {}        
+PLAY_GEN = {}
 DL_QUEUE = None
-WAIT = {}          
-NOTICE = {}        
-WAITING_DL = {} 
+WAIT = {}
+NOTICE = {}
+WAITING_DL = {}
 DATA = {"admins": {}, "fav": {}, "hist": [], "vc_raw": None, "queue": []}
 DATA_DIRTY = False
 DATA_TAG = "MUSICBOT_DATA "
@@ -439,76 +454,141 @@ def probe_duration(path):
 # ==========================================
 # FAST PARALLEL DOWNLOAD (8 KONEKSI)
 # ==========================================
+MIB = 1024 * 1024
+
+
+class DownloadCancelled(Exception):
+    pass
+
+
 async def fast_download(msg, path, item, num_connections=8):
-    """Download paralel multi-koneksi — bisa 10-30x lebih cepat dari serial."""
+    """Download paralel multi-koneksi. File dibagi per kelipatan 1 MiB."""
     file_size = item.get("size") or getattr(msg.file, "size", 0)
-    
-    if not file_size or file_size < 3 * 1024 * 1024:
-        # File kecil, download biasa
+
+    if not file_size or file_size < 3 * MIB:
         def cb(c, t):
+            item["bytes"] = c
             item["pct"] = min(100, int(c * 100 / (t or file_size or 1)))
         return await msg.download_media(file=path, progress_callback=cb)
 
-    chunk_size = (file_size + num_connections - 1) // num_connections
-    
-    # Pre-allocate file
-    with open(path, 'wb') as f:
+    total_chunks = math.ceil(file_size / MIB)
+    per_conn = math.ceil(total_chunks / num_connections)   # jumlah chunk 1 MiB per koneksi
+    n_conn = math.ceil(total_chunks / per_conn)
+
+    with open(path, "wb") as f:
         f.truncate(file_size)
 
     fd = os.open(path, os.O_WRONLY)
-    prog = [0] * num_connections
+    prog = [0] * n_conn
 
-    async def fetch(i, start, end):
+    async def fetch(i):
+        start = i * per_conn * MIB
+        end = min(start + per_conn * MIB, file_size)
         pos = start
-        try:
-            async for piece in userbot_app.iter_download(
-                msg, offset=start, limit=end - start,
-                request_size=1024 * 1024, chunk_size=1024 * 1024
-            ):
-                if item.get("cancelled"):
-                    raise asyncio.CancelledError
-                os.pwrite(fd, piece, pos)
-                pos += len(piece)
-                prog[i] = pos - start
-                item["pct"] = min(100, int(sum(prog) * 100 / file_size))
-        except Exception as e:
-            print(f"[chunk {i}] error: {e}")
-            raise
-
-    tasks = []
-    try:
-        for i in range(num_connections):
-            s = i * chunk_size
-            e = min(s + chunk_size, file_size)
-            if s >= file_size:
+        tries = 0
+        while pos < end:
+            try:
+                # NB: limit di iter_download = jumlah CHUNK, bukan byte
+                async for piece in userbot_app.iter_download(
+                    msg, offset=pos, limit=math.ceil((end - pos) / MIB),
+                    request_size=MIB, chunk_size=MIB
+                ):
+                    if item.get("cancelled"):
+                        raise DownloadCancelled()
+                    os.pwrite(fd, piece, pos)
+                    pos += len(piece)
+                    prog[i] = pos - start
+                    item["bytes"] = sum(prog)
+                    item["pct"] = min(100, int(item["bytes"] * 100 / file_size))
                 break
-            tasks.append(fetch(i, s, e))
-            await asyncio.sleep(0.02)  # stagger agar tidak flood
+            except (DownloadCancelled, asyncio.CancelledError):
+                raise
+            except Exception as e:
+                tries += 1
+                print(f"[chunk {i}] error ({tries}/3): {e}")
+                if tries >= 3:
+                    raise
+                await asyncio.sleep(2 * tries)
+        if pos != end:
+            raise IOError(f"Bagian {i} tidak lengkap ({pos - start}/{end - start} byte)")
+
+    tasks = [asyncio.create_task(fetch(i)) for i in range(n_conn)]
+    try:
         await asyncio.gather(*tasks)
+    except BaseException:
+        # hentikan semua koneksi dulu, baru tutup fd (cegah pwrite ke fd yang sudah ditutup)
+        for t in tasks:
+            t.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        raise
     finally:
         os.close(fd)
-    
     return path
 
-async def _download_film(item, msg, path, req_chat):
+
+async def _guarded(coro, item, stall=120):
+    """Jalankan unduhan. Batal kalau tidak ada kemajuan byte selama `stall` detik,
+    atau kalau item dibatalkan (skip/stop)."""
+    task = asyncio.create_task(coro)
+    last, since = -1, time.time()
     try:
-        await fast_download(msg, path, item)
+        while True:
+            done, _ = await asyncio.wait({task}, timeout=1)
+            if done:
+                return task.result()
+            if item.get("cancelled"):
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+                raise DownloadCancelled()
+            cur = item.get("bytes", 0)
+            if cur != last:
+                last, since = cur, time.time()
+            elif time.time() - since > stall:
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+                raise asyncio.TimeoutError()
     except asyncio.CancelledError:
+        task.cancel()
+        raise
+
+
+async def _download_film(item, msg, path, req_chat):
+    async def serial():
+        def cb(c, t):
+            item["bytes"] = c
+            item["pct"] = min(100, int(c * 100 / (t or item.get("size") or 1)))
+        return await msg.download_media(file=path, progress_callback=cb)
+
+    try:
+        try:
+            await _guarded(fast_download(msg, path, item), item)
+        except (DownloadCancelled, asyncio.TimeoutError):
+            raise
+        except Exception as e:
+            # Paralel gagal -> coba serial. JANGAN set item["error"] dulu,
+            # supaya film tidak di-skip selagi fallback masih jalan.
+            print(f"Unduh paralel gagal ({e}); coba serial…")
+            _rm(path)
+            item["pct"], item["bytes"] = 0, 0
+            await _guarded(serial(), item)
+    except DownloadCancelled:
         _rm(path)
+        item["error"] = "dibatalkan"
+        return None
+    except asyncio.TimeoutError:
+        _rm(path)
+        item["error"] = "timeout (tidak ada kemajuan)"
+        print(f"Unduh film timeout: {item.get('title')}")
         return None
     except Exception as e:
         item["error"] = str(e)[:150]
         print(f"Unduh film gagal: {e}")
         _rm(path)
-        # Fallback: coba download serial kalau paralel gagal
-        try:
-            def cb(c, t):
-                item["pct"] = min(100, int(c * 100 / (t or item.get("size") or 1)))
-            path = await msg.download_media(file=path, progress_callback=cb)
-        except Exception as e2:
-            print(f"Fallback juga gagal: {e2}")
-            return None
+        return None
 
+    if item.get("cancelled"):
+        _rm(path)
+        return None
     item["local"] = path
     item["pct"] = 100
     if not item.get("duration"):
@@ -519,6 +599,7 @@ async def _download_film(item, msg, path, req_chat):
         except Exception:
             pass
     return path
+
 
 async def download_worker():
     """Download berurutan — 1 film selesai dulu baru yang berikutnya."""
@@ -532,6 +613,20 @@ async def download_worker():
         finally:
             DL_QUEUE.task_done()
 
+
+def pending_bytes(vc):
+    """Sisa byte film yang masih antre / sedang diunduh (untuk cek ruang disk)."""
+    items = list(get_queue(vc)) if vc else []
+    cur = current_songs.get(vc) if vc else None
+    if cur and cur.get("loading") and cur.get("item"):
+        items.append(cur["item"])
+    total = 0
+    for x in items:
+        if x.get("is_tg") and not x.get("local") and not x.get("cancelled"):
+            total += int((x.get("size") or 0) * (1 - (x.get("pct") or 0) / 100))
+    return total
+
+
 async def process_video_file(msg, sender_id, chat_id):
     err = need_vc()
     if err:
@@ -542,19 +637,20 @@ async def process_video_file(msg, sender_id, chat_id):
         free = shutil.disk_usage(FILM_DIR).free
     except Exception:
         free = 0
-    if size and free and size * 1.1 > free:
+    if size and free and (size + pending_bytes(TARGET_VC_ID)) * 1.1 > free:
         return await bring_panel(chat_id, "main", f"❌ Ruang disk server tidak cukup ({fmt_size(free)} tersisa).")
-    
+
     ext = os.path.splitext(getattr(f, "name", "") or "")[1].lower()
     if ext not in FILM_EXT:
         ext = ".mp4"
     path = os.path.join(FILM_DIR, f"{msg.id}_{int(time.time())}{ext}")
-    
+
     title = movie_title(msg)
     item = {"title": title, "duration": int(getattr(f, "duration", 0) or 0), "source": "File",
             "video": True, "force_audio": VIDEO_HEIGHT == 0, "by": by_name(sender_id), "size": size,
-            "pct": 0, "local": None, "path": path, "fmt": "file", "is_tg": True, "cancelled": False}
-    
+            "pct": 0, "bytes": 0, "local": None, "path": path, "fmt": "file", "is_tg": True,
+            "cancelled": False}
+
     vc = TARGET_VC_ID
     q = get_queue(vc)
     cur = current_songs.get(vc)
@@ -564,10 +660,13 @@ async def process_video_file(msg, sender_id, chat_id):
 
     if idle:
         asyncio.create_task(play_next(vc))
+        VIEW[chat_id] = "np"
+    else:
+        VIEW[chat_id] = "queue"
     await asyncio.sleep(0)
     note = (f"📥 Mengunduh: <b>{esc(cut(title, 60))}</b> ({fmt_size(size)})"
             + ("" if idle else f" • antrean #{len(q)}"))
-    await bring_panel(chat_id, "np" if idle else "queue", note)
+    await bring_panel(chat_id, VIEW[chat_id], note)
 
 async def on_video(event):
     uid = event.sender_id
@@ -621,7 +720,7 @@ def video_stream(url):
     return MediaStream(url)
 
 def make_stream(song):
-    if song.get("is_tg"): 
+    if song.get("is_tg"):
         return video_stream(song["url"])
     if song.get("force_audio"):
         return audio_stream(song["url"])
@@ -749,7 +848,8 @@ def _resolve_song(item):
         video = False
     errors = []
     if item.get("video") and re.search(r"\.(mp4|mkv|webm|m3u8|mov)(\?|$)", item["page"], re.I):
-        return {"url": item["page"], "title": item["title"], "duration": 0,
+        # durasi dibaca lewat ffprobe supaya lagu berikutnya bisa lanjut otomatis
+        return {"url": item["page"], "title": item["title"], "duration": probe_duration(item["page"]),
                 "source": "Link", "video": video, "force_audio": audio_movie}, None
     try:
         song = _resolve_url(item["page"], src == "YouTube", src or "YouTube", video)
@@ -909,19 +1009,20 @@ async def _update_loading_ui(chat_id, gen):
     while PLAY_GEN.get(chat_id) == gen:
         cur = current_songs.get(chat_id)
         if not cur or not cur.get("loading"): break
-        if VIEW.get(chat_id) == "np":
+        v = VIEW.get(chat_id, "main")
+        if v in ("np", "queue"):
             try:
-                await panel_to(chat_id, "np")
+                await panel_to(chat_id, v)
             except Exception:
                 pass
-        await asyncio.sleep(1)
+        await asyncio.sleep(3)
 
 async def play_next(chat_id):
     gen = PLAY_GEN[chat_id] = PLAY_GEN.get(chat_id, 0) + 1
     cancel_timer(chat_id)
     queue = get_queue(chat_id)
     prev = current_songs.get(chat_id)
-    
+
     if prev and prev.get("loading") and prev.get("item"):
         purge_item(prev["item"])
 
@@ -937,13 +1038,15 @@ async def play_next(chat_id):
 
     song = queue.pop(0)
     was_idle = (not prev) or prev.get("title") == "Silent"
-    
+
     if song.get("is_tg") and not song.get("local"):
         current_songs[chat_id] = {"title": song["title"], "duration": 0, "loading": True,
                                   "by": song.get("by"), "item": song}
+        VIEW[chat_id] = "np"
         _release(prev, None, queue)
         asyncio.create_task(_update_loading_ui(chat_id, gen))
-        
+
+        start_wait = time.time()
         while not song.get("local"):
             if PLAY_GEN.get(chat_id) != gen:
                 purge_item(song)
@@ -951,10 +1054,14 @@ async def play_next(chat_id):
             if song.get("error"):
                 print(f"Skip error: {song['title']}")
                 return await play_next(chat_id)
+            if time.time() - start_wait > DL_WAIT_MAX:  # batas maksimal menunggu (macet ditangani watchdog unduhan)
+                print(f"Timeout waiting for download: {song['title']}")
+                song["error"] = "timeout"
+                return await play_next(chat_id)
             await asyncio.sleep(0.3)
-            
+
         song["url"] = song["local"]
-        
+
     if song.get("lazy"):
         by = song.get("by")
         resolved, err = await asyncio.to_thread(resolve_song, song)
@@ -965,7 +1072,7 @@ async def play_next(chat_id):
             return await play_next(chat_id)
         resolved["by"] = by
         song = resolved
-        
+
     await _start_song(chat_id, song, prev, was_idle)
 
 async def do_enqueue(song, now=False, by=None):
@@ -1164,7 +1271,7 @@ def np_text():
     cur = current_songs.get(TARGET_VC_ID) if TARGET_VC_ID else None
     if not cur or cur["title"] == "Silent":
         return "<b>🎶 Sedang Diputar</b>\n\n<i>Tidak ada yang diputar.</i>"
-    
+
     if cur.get("loading"):
         it = cur.get("item", {})
         pct = it.get("pct", 0)
@@ -1172,7 +1279,7 @@ def np_text():
                 f"<b>{esc(cut(cur['title'], 70))}</b>\n\n"
                 f"<code>{bar(pct, 100)}  {pct}%</code>\n"
                 f"<i>{fmt_size(it.get('size'))} • mulai otomatis setelah selesai</i>")
-                
+
     dur = cur.get("duration") or 0
     pos = elapsed(cur, TARGET_VC_ID)
     by = f"\n👤 Diminta: {esc(cut(cur['by'], 20))}" if cur.get("by") else ""
@@ -1649,7 +1756,7 @@ async def boot_userbot(session):
         await app.disconnect()
         raise RuntimeError("Session tidak valid / sudah logout. Buat ulang file session.")
     await app.get_dialogs()
-    
+
     @app.on(events.NewMessage(incoming=True, func=lambda e: e.is_private and e.document))
     async def on_userbot_doc(event):
         sender = await event.get_sender()
@@ -1657,17 +1764,19 @@ async def boot_userbot(session):
             return
         uname = sender.username.lower()
         if uname in WAITING_DL:
+            if not is_video_msg(event.message):
+                return  # abaikan dokumen non-video, tunggu file filmnya
             req_chat = WAITING_DL.pop(uname)
             await process_video_file(event.message, req_chat, req_chat)
-            
+
     call = PyTgCalls(app)
     await call.start()
     userbot_app, userbot_call = app, call
-    
+
     if DL_QUEUE is None:
         DL_QUEUE = asyncio.Queue()
         asyncio.create_task(download_worker())
-        
+
     await load_data()
     if DATA_DIRTY:
         await save_data()
@@ -1764,25 +1873,30 @@ async def process_bot_link(chat_id, raw, uid):
     parsed = urllib.parse.urlparse(raw)
     if not parsed.netloc or ("t.me" not in parsed.netloc and "telegram.me" not in parsed.netloc):
         return await panel_to(chat_id, "main", "❌ Link tidak valid. Pastikan link dari Telegram.")
-    
+
     bot_username = parsed.path.strip("/")
     if not bot_username:
         return await panel_to(chat_id, "main", "❌ Username bot tidak ditemukan di link.")
-    
+    # username bot Telegram selalu berakhiran "bot" (5-32 karakter)
+    if not re.fullmatch(r"(?i)[a-z][a-z0-9_]{1,28}bot", bot_username):
+        return await panel_to(chat_id, "main", "❌ Link harus ke sebuah <b>bot</b> (username berakhiran <code>bot</code>).")
+    if FILM_BOT_ALLOW and bot_username.lower() not in FILM_BOT_ALLOW:
+        return await panel_to(chat_id, "main", "❌ Bot itu tidak ada di daftar yang diizinkan (FILM_BOT_ALLOW).")
+
     query_params = urllib.parse.parse_qs(parsed.query)
     start_param = query_params.get("start", [None])[0]
-    
+
     if not userbot_app:
         return await panel_to(chat_id, "main", NO_USERBOT)
-        
+
     WAITING_DL[bot_username.lower()] = chat_id
-    
+
     try:
         pesan = f"/start {start_param}" if start_param else "/start"
         await userbot_app.send_message(bot_username, pesan)
-        await panel_to(chat_id, "main", 
+        await panel_to(chat_id, "main",
             f"📤 <b>Menghubungi bot film…</b>\n"
-            f"Bot: @{bot_username}\n"
+            f"Bot: @{esc(bot_username)}\n"
             f"<i>Menunggu balasan file…</i>")
         asyncio.create_task(_reset_waiting_bot(chat_id, bot_username.lower(), 120))
     except Exception as e:
@@ -2290,7 +2404,7 @@ async def on_callback(event):
 async def on_document(event):
     if is_video_msg(event.message):
         return await on_video(event)
-        
+
     if event.sender_id != OWNER_ID:
         return
     name = ""
@@ -2298,7 +2412,7 @@ async def on_document(event):
         if hasattr(a, "file_name"):
             name = a.file_name or ""
     if not name.lower().endswith(".zip"):
-        return 
+        return
 
     msg = await event.reply("⏳ <i>Memproses file…</i>")
     zip_path = await event.download_media()
@@ -2365,7 +2479,7 @@ async def notify_owner(text):
 async def main():
     shutil.rmtree(FILM_DIR, ignore_errors=True)
     os.makedirs(FILM_DIR, exist_ok=True)
-    
+
     print("Memulai Manager Bot...")
     await manager_bot.start(bot_token=BOT_TOKEN)
     print("✅ Manager Bot siap!")
