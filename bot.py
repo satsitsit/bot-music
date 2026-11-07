@@ -14,6 +14,9 @@ import time
 import urllib.request
 import urllib.parse
 import zipfile
+import http.server
+import socketserver
+import threading
 from concurrent.futures import ThreadPoolExecutor
 
 import yt_dlp
@@ -44,6 +47,11 @@ COOKIES = "cookies.txt"
 FILM_DIR = "/tmp/films"
 FILM_EXT = (".mp4", ".mkv", ".webm", ".mov", ".avi", ".m4v")
 os.makedirs(FILM_DIR, exist_ok=True)
+
+# ---- STREAMING SERVER ----
+HTTP_PORT = 8089
+TOTAL_FILE_SIZES = {}
+DOWNLOAD_ERRORS = {}
 
 # ---- HASIL PENCARIAN ----
 MAX_RESULTS = 15      
@@ -110,11 +118,87 @@ PLAY_GEN = {}
 FILM_SEM = None
 WAIT = {}          
 NOTICE = {}        
-WAITING_DL = {} # bot_username -> chat_id (admin yang minta)
+WAITING_DL = {} 
 DATA = {"admins": {}, "fav": {}, "hist": [], "vc_raw": None, "queue": []}
 DATA_DIRTY = False
 DATA_TAG = "MUSICBOT_DATA "
 
+# ==========================================
+# LOCAL HTTP SERVER UNTUK STREAMING
+# ==========================================
+class GrowingFileHandler(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        filepath = os.path.join(FILM_DIR, os.path.basename(self.path))
+        if not os.path.exists(filepath):
+            self.send_error(404)
+            return
+            
+        fname = os.path.basename(filepath)
+        total_size = TOTAL_FILE_SIZES.get(fname, 0)
+        if not total_size:
+            total_size = os.path.getsize(filepath) if os.path.exists(filepath) else 0
+            
+        range_header = self.headers.get('Range')
+        start, end = 0, None
+        if range_header:
+            m = re.match(r'bytes=(\d+)-(\d*)', range_header)
+            if m:
+                start = int(m.group(1))
+                if m.group(2):
+                    end = int(m.group(2))
+        
+        if end is None or end >= total_size:
+            end = total_size - 1
+
+        self.send_response(206 if range_header else 200)
+        self.send_header('Content-Type', 'video/mp4')
+        if range_header:
+            self.send_header('Content-Range', f'bytes {start}-{end}/{total_size}')
+        self.send_header('Content-Length', str(end - start + 1))
+        self.send_header('Accept-Ranges', 'bytes')
+        self.end_headers()
+
+        with open(filepath, 'rb') as f:
+            f.seek(start)
+            left = end - start + 1
+            while left > 0:
+                if not os.path.exists(filepath): 
+                    break
+                try:
+                    current_size = os.path.getsize(filepath)
+                except OSError:
+                    break
+                
+                if start >= current_size:
+                    if DOWNLOAD_ERRORS.get(fname):
+                        break
+                    time.sleep(0.1) 
+                    continue
+                
+                chunk_size = min(1024 * 64, left, current_size - start)
+                data = f.read(chunk_size)
+                if not data:
+                    time.sleep(0.1)
+                    continue
+                
+                try:
+                    self.wfile.write(data)
+                except (BrokenPipeError, ConnectionResetError):
+                    break
+                start += len(data)
+                left -= len(data)
+                
+    def log_message(self, format, *args):
+        pass 
+
+def start_http_server():
+    socketserver.TCPServer.allow_reuse_address = True
+    with socketserver.TCPServer(("127.0.0.1", HTTP_PORT), GrowingFileHandler) as httpd:
+        httpd.serve_forever()
+
+# ==========================================
+# HELPER UMUM
+# ==========================================
 def get_queue(chat_id):
     return queues.setdefault(chat_id, [])
 
@@ -427,20 +511,11 @@ def _release(prev, new, queue):
         return
     _rm(path)
 
-def probe_duration(path):
-    try:
-        out = subprocess.run(
-            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
-             "-of", "default=nw=1:nk=1", path],
-            capture_output=True, text=True, timeout=20).stdout.strip()
-        return int(float(out))
-    except Exception:
-        return 0
-
 async def _download_film(item, msg, path, req_chat):
     global FILM_SEM
     if FILM_SEM is None:
         FILM_SEM = asyncio.Semaphore(2)
+    fname = os.path.basename(path)
     async with FILM_SEM:
         def prog(cur, total):
             item["pct"] = int(cur * 100 / total) if total else 0
@@ -451,31 +526,20 @@ async def _download_film(item, msg, path, req_chat):
             raise
         except Exception as e:
             item["error"] = str(e)[:150]
+            DOWNLOAD_ERRORS[fname] = True
             print(f"Unduh film gagal: {e}")
             _rm(path)
             out = None
     if not out:
         item["error"] = item.get("error") or "gagal diunduh"
-        try:
-            await panel_to(req_chat, VIEW.get(req_chat, "main"),
-                           f"❌ Gagal mengunduh <b>{esc(cut(item['title'], 50))}</b>: {esc(item['error'])}")
-        except Exception:
-            pass
         return None
     item["local"] = out
     item["pct"] = 100
-    if not item.get("duration"):
-        item["duration"] = await asyncio.to_thread(probe_duration, out)
     if AUTO_CLEAN:
         try:
             await msg.delete()
         except Exception:
             pass
-    try:
-        await panel_to(req_chat, VIEW.get(req_chat, "main"),
-                       f"✅ Siap: <b>{esc(cut(item['title'], 50))}</b>")
-    except Exception:
-        pass
     return out
 
 async def process_video_file(msg, sender_id, chat_id):
@@ -495,11 +559,14 @@ async def process_video_file(msg, sender_id, chat_id):
     if ext not in FILM_EXT:
         ext = ".mp4"
     path = os.path.join(FILM_DIR, f"{msg.id}_{int(time.time())}{ext}")
+    TOTAL_FILE_SIZES[os.path.basename(path)] = size
     title = movie_title(msg)
     item = {"title": title, "duration": int(getattr(f, "duration", 0) or 0), "source": "File",
             "video": True, "force_audio": VIDEO_HEIGHT == 0, "by": by_name(sender_id), "size": size,
             "pct": 0, "local": None, "path": path, "fmt": "file", "is_tg": True}
+    
     item["task"] = asyncio.create_task(_download_film(item, msg, path, chat_id))
+    
     vc = TARGET_VC_ID
     q = get_queue(vc)
     cur = current_songs.get(vc)
@@ -508,17 +575,15 @@ async def process_video_file(msg, sender_id, chat_id):
     if idle:
         asyncio.create_task(play_next(vc))
     await asyncio.sleep(0)
-    note = (f"📥 Mengunduh <b>{esc(cut(title, 60))}</b> ({fmt_size(size)})"
+    note = (f"📥 Menyiapkan stream: <b>{esc(cut(title, 60))}</b> ({fmt_size(size)})"
             + ("" if idle else f" • antrean #{len(q)}"))
     await bring_panel(chat_id, "np" if idle else "queue", note)
-
 
 async def on_video(event):
     uid = event.sender_id
     if not is_admin(uid):
         return await deny(event)
     await process_video_file(event.message, uid, event.chat_id)
-
 
 # ==========================================
 # HELPER PY-TGCALLS
@@ -767,7 +832,6 @@ def make_collage(items, start_index=0):
             raw = _fetch(it["thumb"])
             return Image.open(io.BytesIO(raw)).convert("RGB")
         except Exception as e:
-            print(f"Thumb gagal diunduh: {e}")
             return None
 
     with ThreadPoolExecutor(max_workers=5) as ex:
@@ -852,20 +916,24 @@ async def _start_song(chat_id, song, prev, was_idle):
     schedule_save()
 
 async def _await_film(chat_id, song, gen):
-    try:
-        await song["task"]
-    except asyncio.CancelledError:
-        pass
-    except Exception as e:
-        print(f"Unduhan error: {e}")
-    if PLAY_GEN.get(chat_id) != gen:
-        purge_item(song)
-        return
-    if not song.get("local"):
-        print(f"Lewati film (gagal diunduh): {song.get('title')}")
+    local_path = song.get("path")
+    if not local_path:
         return await play_next(chat_id)
-    song["url"] = song["local"]
-    song.pop("task", None)
+    
+    # Tunggu sampai file minimal 2 MB (atau file sudah selesai diunduh) sebelum diputar
+    while True:
+        if PLAY_GEN.get(chat_id) != gen:
+            purge_item(song)
+            return
+        if song.get("local") or os.path.exists(local_path) and os.path.getsize(local_path) > 2 * 1024 * 1024:
+            break
+        if DOWNLOAD_ERRORS.get(os.path.basename(local_path)):
+            print(f"Streaming gagal: {song.get('title')}")
+            return await play_next(chat_id)
+        await asyncio.sleep(0.2)
+        
+    fname = os.path.basename(local_path)
+    song["url"] = f"http://127.0.0.1:{HTTP_PORT}/{fname}"
     await _start_song(chat_id, song, None, False)
 
 async def play_next(chat_id):
@@ -1107,10 +1175,10 @@ def np_text():
     if cur.get("loading"):
         it = cur.get("item", {})
         pct = it.get("pct", 0)
-        return ("<b>🎶 Sedang Diputar</b>\n\n⏳ <b>Mengunduh film…</b>\n"
+        return ("<b>🎶 Sedang Diputar</b>\n\n⏳ <b>Menyiapkan Stream…</b>\n"
                 f"<b>{esc(cut(cur['title'], 70))}</b>\n\n"
                 f"<code>{bar(pct, 100)}  {pct}%</code>\n"
-                f"<i>{fmt_size(it.get('size'))} • mulai otomatis setelah selesai</i>")
+                f"<i>{fmt_size(it.get('size'))} • Buffering…</i>")
                 
     dur = cur.get("duration") or 0
     pos = elapsed(cur, TARGET_VC_ID)
@@ -1587,7 +1655,6 @@ async def boot_userbot(session):
         raise RuntimeError("Session tidak valid / sudah logout. Buat ulang file session.")
     await app.get_dialogs()
     
-    # Handler untuk menyedot balasan dari Bot Film (Lk21)
     @app.on(events.NewMessage(incoming=True, func=lambda e: e.is_private and e.document))
     async def on_userbot_doc(event):
         sender = await event.get_sender()
@@ -2006,7 +2073,6 @@ async def on_text(event):
     if kind == "addadmin":
         return await panel_to(chat, "admins", await do_addadmin(text))
 
-    # Deteksi otomatis jika admin paste Link Bot Lk21
     if (kind == "bot" or kind == "play") and text.startswith("http") and ("t.me" in text or "telegram.me" in text) and "start=" in text:
         return await process_bot_link(chat, text, uid)
 
@@ -2299,6 +2365,10 @@ async def notify_owner(text):
 async def main():
     shutil.rmtree(FILM_DIR, ignore_errors=True)
     os.makedirs(FILM_DIR, exist_ok=True)
+    
+    # Nyalakan HTTP Server untuk streaming di thread terpisah
+    threading.Thread(target=start_http_server, daemon=True).start()
+    
     print("Memulai Manager Bot...")
     await manager_bot.start(bot_token=BOT_TOKEN)
     print("✅ Manager Bot siap!")
