@@ -9,8 +9,10 @@ import os
 import random
 import re
 import shutil
+import subprocess
 import time
 import urllib.request
+import urllib.parse
 import zipfile
 from concurrent.futures import ThreadPoolExecutor
 
@@ -26,12 +28,9 @@ from pytgcalls.types import MediaStream, GroupCallConfig
 
 # ==========================================
 # KONFIGURASI
-# Dibaca dari Secrets/env dulu. Kalau kosong, pakai nilai di sini.
-# (Repo PUBLIC? Kosongkan nilai bawaan di bawah dan isi lewat Secrets!)
 # ==========================================
 def _env(name, default=""):
     return os.environ.get(name) or default
-
 
 API_ID = int(_env("API_ID", "32333215"))
 API_HASH = _env("API_HASH", "3d9a1c2ab47d6a7b6fff1b452ab22452")
@@ -42,9 +41,13 @@ SESSION_STRING = _env("SESSION_STRING")
 SILENT_AUDIO = "https://github.com/anars/blank-audio/raw/master/1-second-of-silence.mp3"
 COOKIES = "cookies.txt"
 
+FILM_DIR = "/tmp/films"
+FILM_EXT = (".mp4", ".mkv", ".webm", ".mov", ".avi", ".m4v")
+os.makedirs(FILM_DIR, exist_ok=True)
+
 # ---- HASIL PENCARIAN ----
-MAX_RESULTS = 15      # total hasil yang dicari
-PAGE_SIZE = 5         # hasil per halaman
+MAX_RESULTS = 15      
+PAGE_SIZE = 5         
 
 # ---- FILTER LAGU ----
 FILTER_ON = True
@@ -73,13 +76,13 @@ VIDEO_SIZES = {
 FIRST_PLAY_RETRY = True
 AUDIO_PLAIN = True
 LOOP = False
-SAVE_DELAY = 20       # detik jeda sebelum menyimpan perubahan
-PLAYLIST_MAX = 25     # maksimal lagu dari satu playlist
+SAVE_DELAY = 20       
+PLAYLIST_MAX = 25     
 FAV_MAX = 30
 HIST_MAX = 15
 QUEUE_SAVE_MAX = 30
 VOLUME = 100
-AUTO_CLEAN = True     # hapus perintah & balasan singkat supaya chat tidak penuh
+AUTO_CLEAN = True     
 
 START_TIME = time.time()
 manager_bot = TelegramClient(MemorySession(), API_ID, API_HASH)
@@ -94,41 +97,38 @@ TARGET_VC_ID = None
 queues = {}
 current_songs = {}
 timers = {}
-PENDING = {}        # chat_id -> state hasil pencarian
-PANELS = {}         # chat_id -> id pesan panel yang aktif
-VIEW = {}           # chat_id -> tampilan panel aktif
+PENDING = {}        
+PANELS = {}         
+VIEW = {}           
 REQUESTS = {}
 ASKED = set()
-LISTPAGE = {}      # (uid, jenis) -> halaman favorit/riwayat
+LISTPAGE = {}      
 SLEEP = {"task": None, "until": 0}
 LAST_SAVED = b""
 _save_task = None
-WAIT = {}          # chat_id -> jenis input yang ditunggu (play/vplay/fast/setvc/addadmin)
-NOTICE = {}        # chat_id -> catatan sekali tampil di panel
+PLAY_GEN = {}        
+FILM_SEM = None
+WAIT = {}          
+NOTICE = {}        
+WAITING_DL = {} # bot_username -> chat_id (admin yang minta)
 DATA = {"admins": {}, "fav": {}, "hist": [], "vc_raw": None, "queue": []}
 DATA_DIRTY = False
 DATA_TAG = "MUSICBOT_DATA "
 
-
 def get_queue(chat_id):
     return queues.setdefault(chat_id, [])
-
 
 def silent_song():
     return {"url": SILENT_AUDIO, "title": "Silent", "duration": 0}
 
-
 def esc(text):
     return _html.escape(str(text if text is not None else ""), quote=False)
 
-
 clean = esc
-
 
 def cut(text, n):
     text = str(text or "")
     return text if len(text) <= n else text[: n - 1] + "…"
-
 
 def fmt_dur(sec):
     if not sec:
@@ -136,35 +136,34 @@ def fmt_dur(sec):
     sec = int(sec)
     return f"{sec // 60}:{sec % 60:02d}"
 
+def fmt_size(n):
+    if not n:
+        return "?"
+    return f"{n / 1048576:.0f} MB" if n < 1073741824 else f"{n / 1073741824:.2f} GB"
 
 def quality_label():
     return "suara saja" if VIDEO_HEIGHT == 0 else f"{VIDEO_HEIGHT}p"
 
-
 def onoff(v):
     return "ON" if v else "OFF"
-
 
 def is_owner(uid):
     return uid == OWNER_ID
 
-
 def is_admin(uid):
     return uid == OWNER_ID or str(uid) in DATA["admins"]
-
 
 def toast(text):
     return _html.unescape(re.sub(r"<[^>]+>", "", str(text)))[:190]
 
-
 # ==========================================
-# PENYIMPANAN (Saved Messages akun userbot, tahan restart)
+# PENYIMPANAN
 # ==========================================
 def snapshot():
     if TARGET_VC_ID:
         cur = current_songs.get(TARGET_VC_ID)
-        items = [cur] if cur and cur.get("title") != "Silent" else []
-        items += get_queue(TARGET_VC_ID)
+        items = [cur] if cur and cur.get("title") != "Silent" and not cur.get("is_tg") else []
+        items += [x for x in get_queue(TARGET_VC_ID) if not x.get("is_tg")]
         DATA["queue"] = [i for i in (mk_item(x) for x in items) if i][:QUEUE_SAVE_MAX]
     return {
         "admins": DATA["admins"], "fav": DATA["fav"], "hist": DATA["hist"],
@@ -173,11 +172,9 @@ def snapshot():
         "prev_height": PREV_HEIGHT, "loop": LOOP, "volume": VOLUME,
     }
 
-
 async def _data_messages():
     msgs = await userbot_app.get_messages("me", search=DATA_TAG.strip(), limit=10)
     return [m for m in msgs if m.out and (m.raw_text or "").startswith(DATA_TAG)]
-
 
 async def save_data():
     global DATA_DIRTY, LAST_SAVED
@@ -200,14 +197,11 @@ async def save_data():
     except Exception as e:
         print(f"Gagal simpan data: {e}")
 
-
 async def _delayed_save():
     await asyncio.sleep(SAVE_DELAY)
     await save_data()
 
-
 def schedule_save():
-    """Simpan perubahan dengan jeda (tidak menyimpan tiap detik)."""
     global _save_task
     if _save_task and not _save_task.done():
         return
@@ -215,7 +209,6 @@ def schedule_save():
         _save_task = asyncio.get_running_loop().create_task(_delayed_save())
     except RuntimeError:
         pass
-
 
 async def load_data():
     global FILTER_ON, VIDEO_HEIGHT, HEMAT_ON, PREV_HEIGHT, LOOP, VOLUME, LAST_SAVED
@@ -252,16 +245,14 @@ async def load_data():
         LOOP = stored.get("loop", LOOP)
         VOLUME = stored.get("volume", VOLUME)
 
-
 # ==========================================
-# ITEM LAGU, RIWAYAT, FAVORIT, TIMER, VOLUME, PLAYLIST, PULIH OTOMATIS
+# ITEM LAGU DLL
 # ==========================================
 def iid(item):
     return hashlib.md5(str(item.get("page") or item.get("title")).encode()).hexdigest()[:8]
 
-
 def mk_item(s):
-    """Data ringkas lagu (cukup untuk diputar ulang nanti). None kalau tidak ada link halaman."""
+    if s.get("is_tg"): return None
     page = s.get("page")
     if not page:
         return None
@@ -269,25 +260,21 @@ def mk_item(s):
             "channel": s.get("channel", ""), "source": s.get("orig_source") or s.get("source") or "YouTube",
             "thumb": s.get("thumb"), "video": bool(s.get("video"))}
 
-
 def lazy(item, by=None):
-    """Item antrean yang baru diambil link audionya saat giliran diputar."""
     return dict(item, lazy=True, by=by)
-
 
 def by_name(uid):
     if uid == OWNER_ID:
         return "Owner"
     return DATA["admins"].get(str(uid), f"ID {uid}")
 
-
 def add_history(song):
+    if song.get("is_tg"): return
     it = mk_item(song)
     if not it:
         return
     DATA["hist"] = ([it] + [h for h in DATA["hist"] if iid(h) != iid(it)])[:HIST_MAX]
     schedule_save()
-
 
 def fav_add(uid, item):
     lst = DATA["fav"].setdefault(str(uid), [])
@@ -298,7 +285,6 @@ def fav_add(uid, item):
     schedule_save()
     return True
 
-
 def fav_del(uid, id_):
     lst = DATA["fav"].get(str(uid), [])
     n = len(lst)
@@ -307,10 +293,8 @@ def fav_del(uid, id_):
         schedule_save()
     return len(lst) != n
 
-
 def sleep_left():
     return max(0, int(SLEEP["until"] - time.time())) if SLEEP["until"] else 0
-
 
 async def _sleep_worker(sec):
     try:
@@ -321,7 +305,6 @@ async def _sleep_worker(sec):
     SLEEP["task"] = None
     if TARGET_VC_ID:
         await act_stop()
-
 
 def set_sleep(minutes):
     t = SLEEP.get("task")
@@ -334,7 +317,6 @@ def set_sleep(minutes):
     SLEEP["until"] = time.time() + minutes * 60
     SLEEP["task"] = asyncio.get_running_loop().create_task(_sleep_worker(minutes * 60))
     return f"⏰ Musik berhenti otomatis {minutes} menit lagi."
-
 
 async def act_volume(delta=None, value=None):
     global VOLUME
@@ -353,10 +335,8 @@ async def act_volume(delta=None, value=None):
     schedule_save()
     return f"🔊 Volume {v}%"
 
-
 def is_playlist_url(u):
     return bool(re.search(r"youtube\.com/playlist\?|music\.youtube\.com/playlist|soundcloud\.com/[^/]+/sets/", u))
-
 
 def expand_playlist(url, limit):
     src = "SoundCloud" if "soundcloud" in url else "YouTube"
@@ -365,7 +345,6 @@ def expand_playlist(url, limit):
     with yt_dlp.YoutubeDL(opts) as ydl:
         info = ydl.extract_info(url, download=False)
     return _items_from_info(info, src)[:limit]
-
 
 async def do_enqueue_many(items, by=None):
     chat_id = TARGET_VC_ID
@@ -379,9 +358,7 @@ async def do_enqueue_many(items, by=None):
     schedule_save()
     return f"📥 <b>{len(items)}</b> lagu masuk antrean."
 
-
 async def restore_state():
-    """Setelah restart: masuk lagi ke VC terakhir dan lanjutkan antrean."""
     raw = DATA.get("vc_raw")
     if not raw or not userbot_app:
         return None
@@ -397,16 +374,160 @@ async def restore_state():
         return f"♻️ <b>Dipulihkan:</b> VC <code>{TARGET_VC_ID}</code>, {len(saved)} lagu dilanjutkan."
     return f"♻️ VC <code>{TARGET_VC_ID}</code> dipulihkan."
 
+# ==========================================
+# FITUR FILM TELEGRAM & BOT DOWNLOAD
+# ==========================================
+def is_video_msg(msg):
+    d = getattr(msg, "document", None)
+    if not d:
+        return False
+    mime = (getattr(d, "mime_type", "") or "").lower()
+    name = (getattr(getattr(msg, "file", None), "name", "") or "").lower()
+    return mime.startswith("video/") or name.endswith(FILM_EXT)
+
+def movie_title(msg):
+    cap = (getattr(msg, "raw_text", "") or "").strip()
+    m = re.search(r"(?im)^\s*title\s*[:\-]\s*(.+)$", cap)
+    if m:
+        return m.group(1).strip()[:120]
+    for line in cap.splitlines():
+        if line.strip():
+            return line.strip()[:120]
+    name = getattr(getattr(msg, "file", None), "name", "") or "Film"
+    return re.sub(r"[._]+", " ", re.sub(r"\.[A-Za-z0-9]{2,4}$", "", name)).strip() or "Film"
+
+def _rm(path):
+    if path:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+
+def purge_item(item):
+    t = item.get("task")
+    if t and not t.done():
+        t.cancel()
+    _rm(item.get("local"))
+    _rm(item.get("path"))
+
+def purge_current(chat_id):
+    cur = current_songs.get(chat_id)
+    if not cur:
+        return
+    if cur.get("item"):
+        purge_item(cur["item"])
+    elif cur.get("local"):
+        _rm(cur["local"])
+
+def _release(prev, new, queue):
+    path = prev.get("local") if prev else None
+    if not path or (new and new.get("local") == path):
+        return
+    if any(x.get("local") == path for x in queue):
+        return
+    _rm(path)
+
+def probe_duration(path):
+    try:
+        out = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+             "-of", "default=nw=1:nk=1", path],
+            capture_output=True, text=True, timeout=20).stdout.strip()
+        return int(float(out))
+    except Exception:
+        return 0
+
+async def _download_film(item, msg, path, req_chat):
+    global FILM_SEM
+    if FILM_SEM is None:
+        FILM_SEM = asyncio.Semaphore(2)
+    async with FILM_SEM:
+        def prog(cur, total):
+            item["pct"] = int(cur * 100 / total) if total else 0
+        try:
+            out = await msg.download_media(file=path, progress_callback=prog)
+        except asyncio.CancelledError:
+            _rm(path)
+            raise
+        except Exception as e:
+            item["error"] = str(e)[:150]
+            print(f"Unduh film gagal: {e}")
+            _rm(path)
+            out = None
+    if not out:
+        item["error"] = item.get("error") or "gagal diunduh"
+        try:
+            await panel_to(req_chat, VIEW.get(req_chat, "main"),
+                           f"❌ Gagal mengunduh <b>{esc(cut(item['title'], 50))}</b>: {esc(item['error'])}")
+        except Exception:
+            pass
+        return None
+    item["local"] = out
+    item["pct"] = 100
+    if not item.get("duration"):
+        item["duration"] = await asyncio.to_thread(probe_duration, out)
+    if AUTO_CLEAN:
+        try:
+            await msg.delete()
+        except Exception:
+            pass
+    try:
+        await panel_to(req_chat, VIEW.get(req_chat, "main"),
+                       f"✅ Siap: <b>{esc(cut(item['title'], 50))}</b>")
+    except Exception:
+        pass
+    return out
+
+async def process_video_file(msg, sender_id, chat_id):
+    err = need_vc()
+    if err:
+        return await bring_panel(chat_id, "main", err)
+    f = msg.file
+    size = int(getattr(f, "size", 0) or 0)
+    try:
+        free = shutil.disk_usage(FILM_DIR).free
+    except Exception:
+        free = 0
+    if size and free and size * 1.1 > free:
+        return await bring_panel(
+            chat_id, "main", f"❌ Ruang disk server tidak cukup ({fmt_size(free)} tersisa, film {fmt_size(size)}).")
+    ext = os.path.splitext(getattr(f, "name", "") or "")[1].lower()
+    if ext not in FILM_EXT:
+        ext = ".mp4"
+    path = os.path.join(FILM_DIR, f"{msg.id}_{int(time.time())}{ext}")
+    title = movie_title(msg)
+    item = {"title": title, "duration": int(getattr(f, "duration", 0) or 0), "source": "File",
+            "video": True, "force_audio": VIDEO_HEIGHT == 0, "by": by_name(sender_id), "size": size,
+            "pct": 0, "local": None, "path": path, "fmt": "file", "is_tg": True}
+    item["task"] = asyncio.create_task(_download_film(item, msg, path, chat_id))
+    vc = TARGET_VC_ID
+    q = get_queue(vc)
+    cur = current_songs.get(vc)
+    idle = (not cur) or cur["title"] == "Silent"
+    q.append(item)
+    if idle:
+        asyncio.create_task(play_next(vc))
+    await asyncio.sleep(0)
+    note = (f"📥 Mengunduh <b>{esc(cut(title, 60))}</b> ({fmt_size(size)})"
+            + ("" if idle else f" • antrean #{len(q)}"))
+    await bring_panel(chat_id, "np" if idle else "queue", note)
+
+
+async def on_video(event):
+    uid = event.sender_id
+    if not is_admin(uid):
+        return await deny(event)
+    await process_video_file(event.message, uid, event.chat_id)
+
 
 # ==========================================
-# HELPER PY-TGCALLS (tahan beda versi)
+# HELPER PY-TGCALLS
 # ==========================================
 def _ignore_flag():
     flags = getattr(MediaStream, "Flags", None)
     if flags is not None and hasattr(flags, "IGNORE"):
         return flags.IGNORE
     return getattr(MediaStream, "IGNORE", None)
-
 
 def audio_stream(url):
     flag = _ignore_flag()
@@ -416,7 +537,6 @@ def audio_stream(url):
         except TypeError:
             pass
     return MediaStream(url)
-
 
 def _video_quality_candidates():
     out = []
@@ -437,7 +557,6 @@ def _video_quality_candidates():
         pass
     return out
 
-
 def video_stream(url):
     for q in _video_quality_candidates():
         try:
@@ -446,8 +565,9 @@ def video_stream(url):
             continue
     return MediaStream(url)
 
-
 def make_stream(song):
+    if song.get("is_tg"): 
+        return video_stream(song["url"])
     if song.get("force_audio"):
         return audio_stream(song["url"])
     if song.get("video"):
@@ -456,7 +576,6 @@ def make_stream(song):
         return MediaStream(song["url"])
     return audio_stream(song["url"])
 
-
 async def call_any(names, *args, **kwargs):
     for n in names:
         fn = getattr(userbot_call, n, None)
@@ -464,9 +583,8 @@ async def call_any(names, *args, **kwargs):
             return await fn(*args, **kwargs)
     raise AttributeError(f"Method {names} tidak ada di versi py-tgcalls ini")
 
-
 # ==========================================
-# PENCARIAN, FILTER, AMBIL LINK
+# PENCARIAN
 # ==========================================
 def _opts(use_cookies, video=False):
     h = VIDEO_HEIGHT
@@ -483,7 +601,6 @@ def _opts(use_cookies, video=False):
     if use_cookies and os.path.exists(COOKIES):
         opts["cookiefile"] = COOKIES
     return opts
-
 
 def _items_from_info(info, label):
     out = []
@@ -514,14 +631,12 @@ def _items_from_info(info, label):
         })
     return out
 
-
 def _flat_search(prefix, label, query, n):
     opts = _opts(use_cookies=(prefix == "ytsearch"))
     opts["extract_flat"] = True
     with yt_dlp.YoutubeDL(opts) as ydl:
         info = ydl.extract_info(f"{prefix}{n}:{query}", download=False)
     return _items_from_info(info, label)
-
 
 def passes_filter(item):
     d = item.get("duration") or 0
@@ -532,7 +647,6 @@ def passes_filter(item):
         if re.search(rf"\b{re.escape(w.lower())}\b", title):
             return False
     return True
-
 
 def search_candidates(query):
     errors = []
@@ -550,7 +664,6 @@ def search_candidates(query):
             errors.append(f"{label}: {str(e)[:100]}")
     return None, "Lagu tidak ditemukan.\n" + "\n".join(errors)
 
-
 def _song_from_info(v, label, video=False):
     url = v.get("url")
     if not url and v.get("requested_formats"):
@@ -566,14 +679,12 @@ def _song_from_info(v, label, video=False):
         "fmt": f"{v.get('ext', '?')}/{v.get('protocol', '?')}",
     }
 
-
 def _resolve_url(page, use_cookies, label, video=False):
     with yt_dlp.YoutubeDL(_opts(use_cookies, video)) as ydl:
         v = ydl.extract_info(page, download=False)
     if v.get("entries"):
         v = v["entries"][0]
     return _song_from_info(v, label, video)
-
 
 def _resolve_song(item):
     src = item.get("source")
@@ -604,7 +715,6 @@ def _resolve_song(item):
             errors.append(f"SoundCloud: {str(e)[:120]}")
     return None, "\n".join(errors)
 
-
 def resolve_song(item):
     song, err = _resolve_song(item)
     if song:
@@ -614,15 +724,13 @@ def resolve_song(item):
         song["orig_source"] = item.get("source")
     return song, err
 
-
 # ==========================================
-# KOLASE GAMBAR HASIL PENCARIAN (satu gambar, nomor di tiap thumbnail)
+# KOLASE GAMBAR
 # ==========================================
 def _fetch(url, timeout=6):
     req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
     with urllib.request.urlopen(req, timeout=timeout) as r:
         return r.read()
-
 
 def _font(size):
     from PIL import ImageFont
@@ -637,9 +745,7 @@ def _font(size):
     except TypeError:
         return ImageFont.load_default()
 
-
 def make_collage(items, start_index=0):
-    """Gabungkan thumbnail jadi satu gambar bernomor. None kalau Pillow tidak ada."""
     try:
         from PIL import Image, ImageDraw, ImageOps
     except ImportError:
@@ -688,15 +794,13 @@ def make_collage(items, start_index=0):
     bio.seek(0)
     return bio
 
-
 # ==========================================
-# PLAYER
+# PLAYER & BACKGROUND DOWNLOAD
 # ==========================================
 def cancel_timer(chat_id):
     t = timers.pop(chat_id, None)
     if t:
         t.cancel()
-
 
 async def auto_next(chat_id, delay):
     try:
@@ -709,13 +813,11 @@ async def auto_next(chat_id, delay):
     except asyncio.CancelledError:
         pass
 
-
 def schedule_next(chat_id, song, delay):
     cancel_timer(chat_id)
     song["t0"] = time.time()
     song["left"] = delay
     timers[chat_id] = asyncio.create_task(auto_next(chat_id, delay))
-
 
 def elapsed(song, chat_id):
     dur = song.get("duration") or 0
@@ -726,32 +828,10 @@ def elapsed(song, chat_id):
         left -= time.time() - song["t0"]
     return int(min(dur, max(0, dur + 2 - left)))
 
-
-async def play_next(chat_id):
-    cancel_timer(chat_id)
+async def _start_song(chat_id, song, prev, was_idle):
     queue = get_queue(chat_id)
-
-    if not queue:
-        current_songs[chat_id] = silent_song()
-        try:
-            await userbot_call.play(chat_id, audio_stream(SILENT_AUDIO))
-        except Exception as e:
-            print(f"Error silent: {e}")
-        schedule_save()
-        return
-
-    song = queue.pop(0)
-    if song.get("lazy"):
-        by = song.get("by")
-        resolved, err = await asyncio.to_thread(resolve_song, song)
-        if not resolved:
-            print(f"Lewati (gagal diambil): {song.get('title')} | {err}")
-            return await play_next(chat_id)
-        resolved["by"] = by
-        song = resolved
-    prev = current_songs.get(chat_id)
-    was_idle = (not prev) or prev.get("title") == "Silent"
     current_songs[chat_id] = song
+    _release(prev, song, queue)
     try:
         await userbot_call.play(chat_id, make_stream(song))
         if was_idle and not song.get("video") and FIRST_PLAY_RETRY:
@@ -761,7 +841,7 @@ async def play_next(chat_id):
             await call_any(["unmute", "unmute_stream"], chat_id)
         except Exception:
             pass
-        print(f"▶️ Memutar: {song['title']} | {song.get('source')} {song.get('fmt')}")
+        print(f"▶ Memutar: {song['title']} | {song.get('source')} {song.get('fmt')}")
         add_history(song)
         if song.get("duration"):
             schedule_next(chat_id, song, song["duration"] + 2)
@@ -771,6 +851,61 @@ async def play_next(chat_id):
         return
     schedule_save()
 
+async def _await_film(chat_id, song, gen):
+    try:
+        await song["task"]
+    except asyncio.CancelledError:
+        pass
+    except Exception as e:
+        print(f"Unduhan error: {e}")
+    if PLAY_GEN.get(chat_id) != gen:
+        purge_item(song)
+        return
+    if not song.get("local"):
+        print(f"Lewati film (gagal diunduh): {song.get('title')}")
+        return await play_next(chat_id)
+    song["url"] = song["local"]
+    song.pop("task", None)
+    await _start_song(chat_id, song, None, False)
+
+async def play_next(chat_id):
+    gen = PLAY_GEN[chat_id] = PLAY_GEN.get(chat_id, 0) + 1
+    cancel_timer(chat_id)
+    queue = get_queue(chat_id)
+    prev = current_songs.get(chat_id)
+    if prev and prev.get("loading") and prev.get("item"):
+        purge_item(prev["item"])
+
+    if not queue:
+        current_songs[chat_id] = silent_song()
+        _release(prev, None, queue)
+        try:
+            await userbot_call.play(chat_id, audio_stream(SILENT_AUDIO))
+        except Exception as e:
+            print(f"Error silent: {e}")
+        schedule_save()
+        return
+
+    song = queue.pop(0)
+    was_idle = (not prev) or prev.get("title") == "Silent"
+    
+    if song.get("task"):
+        current_songs[chat_id] = {"title": song["title"], "duration": 0, "loading": True,
+                                  "by": song.get("by"), "item": song}
+        _release(prev, None, queue)
+        asyncio.create_task(_await_film(chat_id, song, gen))
+        return
+    if song.get("lazy"):
+        by = song.get("by")
+        resolved, err = await asyncio.to_thread(resolve_song, song)
+        if PLAY_GEN.get(chat_id) != gen:
+            return
+        if not resolved:
+            print(f"Lewati (gagal diambil): {song.get('title')} | {err}")
+            return await play_next(chat_id)
+        resolved["by"] = by
+        song = resolved
+    await _start_song(chat_id, song, prev, was_idle)
 
 async def do_enqueue(song, now=False, by=None):
     chat_id = TARGET_VC_ID
@@ -789,13 +924,11 @@ async def do_enqueue(song, now=False, by=None):
     schedule_save()
     return f"➕ Antrean #{len(q)}: {title}"
 
-
 # ==========================================
-# AKSI KONTROL (dipakai perintah dan tombol)
+# AKSI KONTROL
 # ==========================================
 NO_USERBOT = "❌ Userbot belum online. Owner: kirim file zip session ke bot ini."
 NO_VC = "❌ VC belum diset. Owner: /setvc @usernamegrup"
-
 
 def need_vc():
     if not userbot_call:
@@ -803,7 +936,6 @@ def need_vc():
     if not TARGET_VC_ID:
         return NO_VC
     return None
-
 
 async def act_pause():
     e = need_vc()
@@ -819,7 +951,6 @@ async def act_pause():
     except Exception as ex:
         return f"❌ Gagal: {esc(ex)}"
 
-
 async def act_resume():
     e = need_vc()
     if e:
@@ -833,7 +964,6 @@ async def act_resume():
     except Exception as ex:
         return f"❌ Gagal: {esc(ex)}"
 
-
 async def act_skip():
     e = need_vc()
     if e:
@@ -841,12 +971,15 @@ async def act_skip():
     await play_next(TARGET_VC_ID)
     return "⏭ Di-skip."
 
-
 async def act_stop():
     e = need_vc()
     if e:
         return e
+    PLAY_GEN[TARGET_VC_ID] = PLAY_GEN.get(TARGET_VC_ID, 0) + 1
     cancel_timer(TARGET_VC_ID)
+    for it in get_queue(TARGET_VC_ID):
+        purge_item(it)
+    purge_current(TARGET_VC_ID)
     queues[TARGET_VC_ID] = []
     current_songs[TARGET_VC_ID] = silent_song()
     try:
@@ -856,20 +989,17 @@ async def act_stop():
     schedule_save()
     return "⏹ Dihentikan (tetap di VC)."
 
-
 async def act_loop():
     global LOOP
     LOOP = not LOOP
     await save_data()
     return f"🔁 Loop {onoff(LOOP)}."
 
-
 async def act_filter():
     global FILTER_ON
     FILTER_ON = not FILTER_ON
     await save_data()
     return f"🧹 Filter {onoff(FILTER_ON)}."
-
 
 async def act_hemat(arg=""):
     global VIDEO_HEIGHT, HEMAT_ON, PREV_HEIGHT
@@ -885,7 +1015,6 @@ async def act_hemat(arg=""):
     await save_data()
     return f"💡 Hemat ON ({target}p). Berlaku untuk video berikutnya."
 
-
 async def act_quality(arg):
     global VIDEO_HEIGHT, HEMAT_ON
     arg = (arg or "").strip().lower()
@@ -897,7 +1026,6 @@ async def act_quality(arg):
     await save_data()
     return f"📺 Kualitas diset {quality_label()} (video berikutnya)."
 
-
 async def act_remove(n):
     e = need_vc()
     if e:
@@ -906,18 +1034,19 @@ async def act_remove(n):
     if not (1 <= n <= len(q)):
         return "❌ Nomor tidak ada di antrean."
     s = q.pop(n - 1)
+    purge_item(s)
     schedule_save()
     return f"🗑 Dihapus: {esc(cut(s['title'], 50))}"
-
 
 async def act_clear():
     e = need_vc()
     if e:
         return e
+    for it in get_queue(TARGET_VC_ID):
+        purge_item(it)
     queues[TARGET_VC_ID] = []
     schedule_save()
     return "🧹 Antrean dikosongkan."
-
 
 async def act_shuffle():
     e = need_vc()
@@ -927,13 +1056,11 @@ async def act_shuffle():
     schedule_save()
     return "🔀 Antrean diacak."
 
-
 # ==========================================
-# TAMPILAN PANEL (satu pesan yang diedit di tempat)
+# TAMPILAN PANEL
 # ==========================================
 def B(text, data):
     return Button.inline(text, data.encode())
-
 
 def bar(pos, total, n=12):
     if not total:
@@ -941,14 +1068,11 @@ def bar(pos, total, n=12):
     k = int(n * pos / total)
     return "▰" * k + "▱" * (n - k)
 
-
 def ctrl_row():
     return [B("⏸", "a:pause"), B("▶️", "a:resume"), B("⏭", "a:skip"), B("⏹", "a:stop")]
 
-
 def back_row():
     return [B("◀️ Menu", "v:main")]
-
 
 def panel_text():
     cur = current_songs.get(TARGET_VC_ID) if TARGET_VC_ID else None
@@ -963,24 +1087,31 @@ def panel_text():
         f"📜 Antrean: <b>{qn}</b> lagu</blockquote>\n"
         f"<i>🔁 Loop {onoff(LOOP)} • 🧹 Filter {onoff(FILTER_ON)} • 📺 {quality_label()}"
         f"{' 💡' if HEMAT_ON else ''}</i>\n"
-        "<i>Kirim teks biasa kapan saja untuk mencari lagu.</i>"
+        "<i>Kirim teks untuk cari lagu, atau paste link bot film (Lk21) untuk nonton.</i>"
     )
-
 
 def main_buttons():
     return [
         ctrl_row(),
         [B("🔎 Cari", "i:play"), B("🎬 Nonton", "i:vplay"), B("⚡ Cepat", "i:fast")],
-        [B("🎶 Now", "v:np"), B("📜 Antrean", "v:queue"), B("⚙️ Setelan", "v:settings")],
-        [B("⭐ Favorit", "v:fav"), B("🕘 Riwayat", "v:hist"), B("📡 VC", "v:vc")],
-        [B("👥 Admin", "v:admins"), B("📊", "v:status"), B("❓", "v:help"), B("🔄", "v:main")],
+        [B("📥 Film dari Bot", "i:bot"), B("🎶 Now", "v:np"), B("📜 Antrean", "v:queue")],
+        [B("⚙️ Setelan", "v:settings"), B("⭐ Favorit", "v:fav"), B("🕘 Riwayat", "v:hist")],
+        [B("📡 VC", "v:vc"), B("👥 Admin", "v:admins"), B("📊 Status", "v:status"), B("❓", "v:help")],
     ]
-
 
 def np_text():
     cur = current_songs.get(TARGET_VC_ID) if TARGET_VC_ID else None
     if not cur or cur["title"] == "Silent":
         return "<b>🎶 Sedang Diputar</b>\n\n<i>Tidak ada yang diputar.</i>"
+    
+    if cur.get("loading"):
+        it = cur.get("item", {})
+        pct = it.get("pct", 0)
+        return ("<b>🎶 Sedang Diputar</b>\n\n⏳ <b>Mengunduh film…</b>\n"
+                f"<b>{esc(cut(cur['title'], 70))}</b>\n\n"
+                f"<code>{bar(pct, 100)}  {pct}%</code>\n"
+                f"<i>{fmt_size(it.get('size'))} • mulai otomatis setelah selesai</i>")
+                
     dur = cur.get("duration") or 0
     pos = elapsed(cur, TARGET_VC_ID)
     by = f"\n👤 Diminta: {esc(cut(cur['by'], 20))}" if cur.get("by") else ""
@@ -994,7 +1125,6 @@ def np_text():
         f"<blockquote>🔁 Loop {onoff(LOOP)} • 🔊 {VOLUME}% • 📺 {quality_label()}{by}{sl}</blockquote>"
     )
 
-
 def np_buttons():
     return [
         ctrl_row(),
@@ -1002,7 +1132,6 @@ def np_buttons():
         [B("🔉 -10", "n:vol:-10"), B(f"{VOLUME}%", "noop"), B("🔊 +10", "n:vol:10")],
         back_row(),
     ]
-
 
 def queue_text():
     cur = current_songs.get(TARGET_VC_ID) if TARGET_VC_ID else None
@@ -1015,10 +1144,10 @@ def queue_text():
     lines = []
     for i, s in enumerate(q[:15]):
         by = f" <i>· {esc(cut(s['by'], 12))}</i>" if s.get("by") else ""
-        lines.append(f"{i + 1}. {esc(cut(s['title'], 45))}{by}")
+        st = "" if not s.get("task") else (" ✅" if s.get("local") else f" ⏳{s.get('pct', 0)}%")
+        lines.append(f"{i + 1}. {esc(cut(s['title'], 45))}{st}{by}")
     more = f"\n… dan {len(q) - 15} lagi" if len(q) > 15 else ""
     return head + "<blockquote>" + "\n".join(lines) + more + "</blockquote>"
-
 
 def queue_buttons():
     q = get_queue(TARGET_VC_ID) if TARGET_VC_ID else []
@@ -1029,7 +1158,6 @@ def queue_buttons():
     rows.append([B("🔀 Acak", "a:shuf"), B("🧹 Kosongkan", "a:clr")])
     rows.append([B("⏭ Skip", "a:skip"), B("◀️ Menu", "v:main")])
     return rows
-
 
 def settings_text():
     sl = f"{sleep_left() // 60 + 1} menit lagi" if sleep_left() else "mati"
@@ -1044,7 +1172,6 @@ def settings_text():
         "<i>Kualitas berlaku untuk video berikutnya.</i>"
     )
 
-
 def settings_buttons():
     qrow = [B(f"{'✔' if VIDEO_HEIGHT == q else ''}{q}", f"q:{q}") for q in (144, 240, 360, 480, 720)]
     qrow.append(B("✔🔈" if VIDEO_HEIGHT == 0 else "🔈", "q:audio"))
@@ -1056,17 +1183,14 @@ def settings_buttons():
         back_row(),
     ]
 
-
 def list_data(kind, uid):
     return list(DATA["fav"].get(str(uid), [])) if kind == "fav" else list(DATA["hist"])
-
 
 def _list_page(kind, uid, n_items):
     tp = max(1, math.ceil(n_items / PAGE_SIZE))
     p = min(max(0, LISTPAGE.get((uid, kind), 0)), tp - 1)
     LISTPAGE[(uid, kind)] = p
     return p, tp
-
 
 def list_text(kind, uid):
     items = list_data(kind, uid)
@@ -1082,7 +1206,6 @@ def list_text(kind, uid):
     return (f"<b>{title}</b>\n<i>Halaman {page + 1} dari {tp} • {len(items)} lagu</i>\n\n"
             "<blockquote>" + "\n".join(lines) + "</blockquote>\n"
             f"<i>▶️ = putar/antre • {'🗑 = hapus' if kind == 'fav' else '⭐ = simpan ke favorit'}</i>")
-
 
 def list_buttons(kind, uid):
     items = list_data(kind, uid)
@@ -1104,7 +1227,6 @@ def list_buttons(kind, uid):
         rows.append(back_row())
     return rows
 
-
 def vc_text():
     ub = "🟢 online" if userbot_call else "🔴 offline"
     vc = f"<code>{TARGET_VC_ID}</code>" if TARGET_VC_ID else "<i>belum diset</i>"
@@ -1116,7 +1238,6 @@ def vc_text():
         "Userbot offline? Owner kirim file zip session ke bot ini.</i>"
     )
 
-
 def vc_buttons(uid):
     rows = []
     if is_admin(uid):
@@ -1125,7 +1246,6 @@ def vc_buttons(uid):
         rows.append([B("🔑 Session", "a:session")])
     rows.append(back_row())
     return rows
-
 
 def admins_text():
     lines = [f"👑 Owner • <code>{OWNER_ID}</code>"]
@@ -1139,7 +1259,6 @@ def admins_text():
         "Permintaannya muncul di chat owner dengan tombol Setujui / Tolak.</i>"
     )
 
-
 def admins_buttons(uid):
     rows = []
     if is_owner(uid):
@@ -1147,7 +1266,6 @@ def admins_buttons(uid):
         rows += [[B(f"🗑 {cut(n, 20)}", f"deladm:{u}")] for u, n in list(DATA["admins"].items())[:10]]
     rows.append(back_row())
     return rows
-
 
 def status_text():
     up = int(time.time() - START_TIME)
@@ -1161,7 +1279,6 @@ def status_text():
         f"💾 Data: {'tersimpan' if not DATA_DIRTY else 'menunggu userbot'}</blockquote>"
     )
 
-
 def help_text():
     return (
         "<b>📖 Bantuan</b>\n"
@@ -1170,6 +1287,7 @@ def help_text():
         "/play <i>judul, link, atau link playlist</i> — cari lagu (gambar + halaman)\n"
         "/fast <i>judul</i> — langsung putar hasil teratas\n"
         "/vplay <i>judul atau link</i> — nonton (share screen)\n"
+        "<b>Film dari Bot (Lk21)</b>: Paste link bot (contoh: t.me/BotLk21?start=...) ke sini.\n"
         "Teks biasa tanpa / — cari lagu</blockquote>\n"
         "<b>Kontrol</b>\n<blockquote>"
         "/np — sedang diputar\n/queue — antrean\n/pause • /resume • /skip • /stop\n"
@@ -1194,11 +1312,11 @@ def help_text():
         "Hasil pencarian: tekan nomor • ◀️ ▶️ halaman • ⏩ Langsung ON = putar sekarang</blockquote>"
     )
 
-
 PROMPTS = {
     "play": ("🔎 Cari Lagu", "Ketik <b>judul lagu</b> atau tempel <b>link</b>, lalu kirim."),
     "vplay": ("🎬 Nonton", "Ketik <b>judul video</b> atau tempel <b>link</b>, lalu kirim."),
     "fast": ("⚡ Putar Cepat", "Ketik <b>judul lagu</b>. Hasil teratas langsung diputar."),
+    "bot": ("📥 Film dari Bot", "Tempel <b>link bot film</b> (contoh: <code>https://t.me/Lk21SuksesBot?start=...</code>)\n\nBot akan otomatis mendownload dan memutarnya."),
     "setvc": ("📡 Pilih VC", "Kirim <code>@usernamegrup</code>, link grup, atau ID.\n"
                             "Grup privat: link undangan <code>t.me/+kode</code>."),
     "addadmin": ("➕ Tambah Admin", "Kirim <b>ID angka</b> atau <code>@username</code> orangnya."),
@@ -1206,11 +1324,9 @@ PROMPTS = {
 
 STABLE_VIEWS = {"main", "np", "queue", "settings", "admins", "vc", "help", "status", "input", "fav", "hist"}
 
-
 def input_text(kind):
     title, body = PROMPTS.get(kind, PROMPTS["play"])
     return f"<b>{title}</b>\n\n{body}\n\n<i>Atau tekan Batal.</i>"
-
 
 def render_view(view, uid):
     notice = NOTICE.pop(uid, None)
@@ -1241,12 +1357,7 @@ def render_view(view, uid):
         text += f"\n\n💬 {notice}"
     return text, btns
 
-
-# ==========================================
-# KELOLA PANEL (tanpa spam)
-# ==========================================
 async def show(event, view):
-    """Edit pesan panel yang ditekan, tanpa mengirim pesan baru."""
     chat_id = event.chat_id
     if view not in STABLE_VIEWS:
         view = "main"
@@ -1259,9 +1370,7 @@ async def show(event, view):
         if "not modified" not in str(e).lower():
             print(f"Edit panel gagal: {e}")
 
-
 async def panel_to(chat_id, view="main", notice=None):
-    """Perbarui panel yang sudah ada (edit di tempat). Kalau tidak ada, kirim baru."""
     VIEW[chat_id] = view
     if notice:
         NOTICE[chat_id] = notice
@@ -1277,7 +1386,6 @@ async def panel_to(chat_id, view="main", notice=None):
     m = await manager_bot.send_message(chat_id, text, buttons=btns)
     PANELS[chat_id] = m.id
 
-
 async def delete_panel(chat_id):
     mid = PANELS.pop(chat_id, None)
     if mid:
@@ -1286,9 +1394,7 @@ async def delete_panel(chat_id):
         except Exception:
             pass
 
-
 async def bring_panel(chat_id, view="main", notice=None):
-    """Hapus panel lama lalu kirim panel baru di paling bawah (selalu terlihat)."""
     await delete_panel(chat_id)
     VIEW[chat_id] = view
     if notice:
@@ -1296,7 +1402,6 @@ async def bring_panel(chat_id, view="main", notice=None):
     text, btns = render_view(view, chat_id)
     m = await manager_bot.send_message(chat_id, text, buttons=btns)
     PANELS[chat_id] = m.id
-
 
 async def cleanup_cmd(event):
     cid = getattr(event, "id", None)
@@ -1306,7 +1411,6 @@ async def cleanup_cmd(event):
         except Exception:
             pass
 
-
 async def _delete_later(chat_id, ids, ttl):
     await asyncio.sleep(ttl)
     try:
@@ -1314,27 +1418,19 @@ async def _delete_later(chat_id, ids, ttl):
     except Exception:
         pass
 
-
 async def cmd_done(event, notice=None, view=None):
-    """Akhir perintah ketik: hapus perintahnya, tampilkan panel terbaru + catatan."""
     await cleanup_cmd(event)
     v = view or VIEW.get(event.chat_id, "main")
     if v not in STABLE_VIEWS or v == "input":
         v = "main"
     await bring_panel(event.chat_id, v, notice)
 
-
-# ==========================================
-# HASIL PENCARIAN: satu pesan (kolase gambar) + halaman
-# ==========================================
 def page_items(st):
     s = st["page"] * PAGE_SIZE
     return st["results"][s:s + PAGE_SIZE]
 
-
 def total_pages(st):
     return max(1, math.ceil(len(st["results"]) / PAGE_SIZE))
-
 
 def results_caption(st):
     start = st["page"] * PAGE_SIZE
@@ -1355,7 +1451,6 @@ def results_caption(st):
         cap += f"\n\n{st['status']}"
     return cap
 
-
 def results_buttons(st):
     start = st["page"] * PAGE_SIZE
     n = len(page_items(st))
@@ -1369,7 +1464,6 @@ def results_buttons(st):
         [B(f"⏩ Langsung: {onoff(st['now'])}", "nowtoggle"), B("🔎 Cari lagi", "i:again"),
          B("🏠 Menu", "home")],
     ]
-
 
 async def show_results(chat_id, query, results, video):
     old = PENDING.pop(chat_id, None)
@@ -1398,7 +1492,6 @@ async def show_results(chat_id, query, results, video):
     st["mid"] = msg.id
     PENDING[chat_id] = st
 
-
 async def rerender_results(event, st, new_image):
     cap, btns = results_caption(st), results_buttons(st)
     try:
@@ -1415,7 +1508,6 @@ async def rerender_results(event, st, new_image):
     except Exception as e:
         if "not modified" not in str(e).lower():
             print(f"Edit hasil gagal: {e}")
-
 
 async def handle_pick(event, idx):
     st = PENDING.get(event.chat_id)
@@ -1438,10 +1530,6 @@ async def handle_pick(event, idx):
         st["busy"] = False
     await rerender_results(event, st, new_image=False)
 
-
-# ==========================================
-# RESOLVE TARGET GRUP (ID / @username / link)
-# ==========================================
 async def resolve_chat(app, raw):
     raw = raw.strip()
     m = re.search(r"(?:t\.me|telegram\.me)/(?:joinchat/|\+)([\w-]+)", raw)
@@ -1468,10 +1556,6 @@ async def resolve_chat(app, raw):
         await app.get_entity(chat_id)
     return chat_id
 
-
-# ==========================================
-# USERBOT: NYALA / MATI
-# ==========================================
 async def shutdown_userbot():
     global userbot_app, userbot_call, TARGET_VC_ID
     for cid in list(current_songs.keys()):
@@ -1493,7 +1577,6 @@ async def shutdown_userbot():
     userbot_app = None
     userbot_call = None
 
-
 async def boot_userbot(session):
     global userbot_app, userbot_call
     await shutdown_userbot()
@@ -1503,6 +1586,18 @@ async def boot_userbot(session):
         await app.disconnect()
         raise RuntimeError("Session tidak valid / sudah logout. Buat ulang file session.")
     await app.get_dialogs()
+    
+    # Handler untuk menyedot balasan dari Bot Film (Lk21)
+    @app.on(events.NewMessage(incoming=True, func=lambda e: e.is_private and e.document))
+    async def on_userbot_doc(event):
+        sender = await event.get_sender()
+        if not sender or not getattr(sender, "username", None):
+            return
+        uname = sender.username.lower()
+        if uname in WAITING_DL:
+            req_chat = WAITING_DL.pop(uname)
+            await process_video_file(event.message, req_chat, req_chat)
+            
     call = PyTgCalls(app)
     await call.start()
     userbot_app, userbot_call = app, call
@@ -1510,10 +1605,6 @@ async def boot_userbot(session):
     if DATA_DIRTY:
         await save_data()
 
-
-# ==========================================
-# AKSI BERSAMA (dipakai tombol DAN perintah)
-# ==========================================
 async def do_setvc(raw):
     global TARGET_VC_ID
     if not userbot_app:
@@ -1541,16 +1632,19 @@ async def do_setvc(raw):
         )
         return f"❌ <b>Gagal masuk</b>\n<code>{esc(cut(e, 200))}</code>\n<i>{hint}</i>"
 
-
 async def do_unsetvc():
     global TARGET_VC_ID
     if not TARGET_VC_ID:
         return "ℹ️ VC memang belum diset."
+    PLAY_GEN[TARGET_VC_ID] = PLAY_GEN.get(TARGET_VC_ID, 0) + 1
     cancel_timer(TARGET_VC_ID)
     try:
         await call_any(["leave_call", "leave_group_call"], TARGET_VC_ID)
     except Exception:
         pass
+    for it in get_queue(TARGET_VC_ID):
+        purge_item(it)
+    purge_current(TARGET_VC_ID)
     queues[TARGET_VC_ID] = []
     current_songs.pop(TARGET_VC_ID, None)
     TARGET_VC_ID = None
@@ -1558,7 +1652,6 @@ async def do_unsetvc():
     DATA["queue"] = []
     schedule_save()
     return "✅ Keluar dari VC."
-
 
 async def do_addadmin(raw):
     a = raw.strip()
@@ -1586,7 +1679,6 @@ async def do_addadmin(raw):
         pass
     return f"✅ <b>{esc(name)}</b> (<code>{uid}</code>) sekarang admin."
 
-
 async def send_session(chat_id):
     if not userbot_app:
         return NO_USERBOT
@@ -1600,9 +1692,43 @@ async def send_session(chat_id):
     asyncio.create_task(_delete_later(chat_id, [m.id], 90))
     return "🔑 SESSION_STRING dikirim (terhapus otomatis 90 detik)."
 
+async def process_bot_link(chat_id, raw, uid):
+    global WAITING_DL
+    parsed = urllib.parse.urlparse(raw)
+    if not parsed.netloc or ("t.me" not in parsed.netloc and "telegram.me" not in parsed.netloc):
+        return await panel_to(chat_id, "main", "❌ Link tidak valid. Pastikan link dari Telegram.")
+    
+    bot_username = parsed.path.strip("/")
+    if not bot_username:
+        return await panel_to(chat_id, "main", "❌ Username bot tidak ditemukan di link.")
+    
+    query_params = urllib.parse.parse_qs(parsed.query)
+    start_param = query_params.get("start", [None])[0]
+    
+    if not userbot_app:
+        return await panel_to(chat_id, "main", NO_USERBOT)
+        
+    WAITING_DL[bot_username.lower()] = chat_id
+    
+    try:
+        pesan = f"/start {start_param}" if start_param else "/start"
+        await userbot_app.send_message(bot_username, pesan)
+        await panel_to(chat_id, "main", 
+            f"📤 <b>Menghubungi bot film…</b>\n"
+            f"Bot: @{bot_username}\n"
+            f"<i>Menunggu balasan file…</i>")
+        asyncio.create_task(_reset_waiting_bot(chat_id, bot_username.lower(), 120))
+    except Exception as e:
+        return await panel_to(chat_id, "main", f"❌ Gagal mengirim pesan ke bot: {esc(cut(e, 100))}")
+
+async def _reset_waiting_bot(chat_id, bot_uname, detik):
+    global WAITING_DL
+    await asyncio.sleep(detik)
+    if bot_uname in WAITING_DL:
+        WAITING_DL.pop(bot_uname)
+        await panel_to(chat_id, "main", "⏰ Bot film tidak merespons dalam 2 menit. Coba lagi.")
 
 async def run_search(chat_id, kind, q, by=None):
-    """Cari lalu tampilkan hasil. Mengembalikan catatan (HTML) kalau tidak ada hasil untuk dipilih."""
     err = need_vc()
     if err:
         return err
@@ -1650,21 +1776,15 @@ async def run_search(chat_id, kind, q, by=None):
     await show_results(chat_id, q, results, video)
     return None
 
-
-# ==========================================
-# PERINTAH KETIK (alternatif, hasilnya tetap lewat panel)
-# ==========================================
 def arg_of(event):
     parts = (event.raw_text or "").split(None, 1)
     return parts[1].strip() if len(parts) > 1 else ""
-
 
 async def deny(event):
     await event.reply(
         f"⛔ <b>Kamu belum jadi admin.</b>\n\nID kamu: <code>{event.sender_id}</code>",
         buttons=[[B("🙋 Minta akses ke owner", "req")]],
     )
-
 
 def cmd(pattern, owner=False):
     def deco(fn):
@@ -1679,7 +1799,6 @@ def cmd(pattern, owner=False):
         manager_bot.on(events.NewMessage(pattern=pattern, func=lambda e: e.is_private))(wrapper)
         return wrapper
     return deco
-
 
 async def search_cmd(event, kind):
     chat = event.chat_id
@@ -1696,57 +1815,46 @@ async def search_cmd(event, kind):
     if notice:
         await panel_to(chat, "main", notice)
 
-
 @cmd(r"^/(start|panel|menu)(?:\s|$)")
 async def c_start(event):
     WAIT.pop(event.chat_id, None)
     await cmd_done(event, view="main")
 
-
 @cmd(r"^/np(?:\s|$)")
 async def c_np(event):
     await cmd_done(event, view="np")
-
 
 @cmd(r"^/queue(?:\s|$)")
 async def c_queue(event):
     await cmd_done(event, view="queue")
 
-
 @cmd(r"^/settings(?:\s|$)")
 async def c_settings(event):
     await cmd_done(event, view="settings")
-
 
 @cmd(r"^/admins(?:\s|$)")
 async def c_admins(event):
     await cmd_done(event, view="admins")
 
-
 @cmd(r"^/help(?:\s|$)")
 async def c_help(event):
     await cmd_done(event, view="help")
-
 
 @cmd(r"^/status(?:\s|$)")
 async def c_status(event):
     await cmd_done(event, view="status")
 
-
 @cmd(r"^/play(?:\s|$)")
 async def c_play(event):
     await search_cmd(event, "play")
-
 
 @cmd(r"^/fast(?:\s|$)")
 async def c_fast(event):
     await search_cmd(event, "fast")
 
-
 @cmd(r"^/vplay(?:\s|$)")
 async def c_vplay(event):
     await search_cmd(event, "vplay")
-
 
 @cmd(r"^/setvc(?:\s|$)")
 async def c_setvc(event):
@@ -1761,11 +1869,9 @@ async def c_setvc(event):
     await bring_panel(chat, "busy")
     await panel_to(chat, "vc", await do_setvc(raw))
 
-
 @cmd(r"^/unsetvc(?:\s|$)")
 async def c_unsetvc(event):
     await cmd_done(event, await do_unsetvc(), view="vc")
-
 
 @cmd(r"^/addadmin(?:\s|$)", owner=True)
 async def c_addadmin(event):
@@ -1777,7 +1883,6 @@ async def c_addadmin(event):
         return await bring_panel(chat, "input")
     await bring_panel(chat, "admins", await do_addadmin(raw))
 
-
 @cmd(r"^/deladmin(?:\s|$)", owner=True)
 async def c_deladmin(event):
     a = arg_of(event)
@@ -1787,32 +1892,29 @@ async def c_deladmin(event):
     await save_data()
     await cmd_done(event, f"🗑 {esc(name)} dihapus dari admin.", view="admins")
 
-
 @cmd(r"^/getsession(?:\s|$)", owner=True)
 async def c_getsession(event):
     note = await send_session(event.chat_id)
     await cmd_done(event, note, view="vc")
 
-
 @cmd(r"^/fav(?:\s|$)")
 async def c_fav(event):
     await cmd_done(event, view="fav")
-
 
 @cmd(r"^/history(?:\s|$)")
 async def c_history(event):
     await cmd_done(event, view="hist")
 
-
 @cmd(r"^/save(?:\s|$)")
 async def c_save(event):
     cur = current_songs.get(TARGET_VC_ID) if TARGET_VC_ID else None
+    if cur and cur.get("is_tg"):
+        return await cmd_done(event, "❌ Video Telegram tidak bisa disimpan ke favorit.")
     item = mk_item(cur) if cur and cur.get("title") != "Silent" else None
     if not item:
         return await cmd_done(event, "❌ Tidak ada lagu yang bisa disimpan.")
     note = "⭐ Disimpan ke favorit." if fav_add(event.sender_id, item) else "ℹ️ Sudah ada di favorit."
     await cmd_done(event, note)
-
 
 @cmd(r"^/volume(?:\s|$)")
 async def c_volume(event):
@@ -1820,7 +1922,6 @@ async def c_volume(event):
     if not a.isdigit():
         return await cmd_done(event, f"🔊 Volume sekarang {VOLUME}%. Ubah: /volume 0-200")
     await cmd_done(event, await act_volume(value=int(a)))
-
 
 @cmd(r"^/sleep(?:\s|$)")
 async def c_sleep(event):
@@ -1831,41 +1932,33 @@ async def c_sleep(event):
         return await cmd_done(event, "Cara pakai: /sleep 30 (menit) atau /sleep off", view="settings")
     await cmd_done(event, set_sleep(min(int(a), 600)), view="settings")
 
-
 @cmd(r"^/pause(?:\s|$)")
 async def c_pause(event):
     await cmd_done(event, await act_pause())
-
 
 @cmd(r"^/resume(?:\s|$)")
 async def c_resume(event):
     await cmd_done(event, await act_resume())
 
-
 @cmd(r"^/skip(?:\s|$)")
 async def c_skip(event):
     await cmd_done(event, await act_skip())
-
 
 @cmd(r"^/stop(?:\s|$)")
 async def c_stop(event):
     await cmd_done(event, await act_stop())
 
-
 @cmd(r"^/loop(?:\s|$)")
 async def c_loop(event):
     await cmd_done(event, await act_loop())
-
 
 @cmd(r"^/shuffle(?:\s|$)")
 async def c_shuffle(event):
     await cmd_done(event, await act_shuffle())
 
-
 @cmd(r"^/clear(?:\s|$)")
 async def c_clear(event):
     await cmd_done(event, await act_clear())
-
 
 @cmd(r"^/remove(?:\s|$)")
 async def c_remove(event):
@@ -1874,21 +1967,17 @@ async def c_remove(event):
         return await cmd_done(event, "Cara pakai: /remove 2", view="queue")
     await cmd_done(event, await act_remove(int(a)), view="queue")
 
-
 @cmd(r"^/filter(?:\s|$)")
 async def c_filter(event):
     await cmd_done(event, await act_filter())
-
 
 @cmd(r"^/hemat(?:\s|$)")
 async def c_hemat(event):
     await cmd_done(event, await act_hemat(arg_of(event)), view="settings")
 
-
 @cmd(r"^/quality(?:\s|$)")
 async def c_quality(event):
     await cmd_done(event, await act_quality(arg_of(event)), view="settings")
-
 
 @cmd(r"^/amode(?:\s|$)")
 async def c_amode(event):
@@ -1896,13 +1985,10 @@ async def c_amode(event):
     AUDIO_PLAIN = not AUDIO_PLAIN
     await cmd_done(event, f"🔊 Mode audio: {'BIASA' if AUDIO_PLAIN else 'AUDIO-ONLY'}. Putar ulang untuk mencoba.")
 
-
 # ==========================================
-# TEKS BIASA (jawaban untuk tombol, atau langsung cari lagu)
+# HANDLER VIDEO & TEKS
 # ==========================================
-@manager_bot.on(events.NewMessage(
-    func=lambda e: e.is_private and not e.document and (e.raw_text or "").strip()
-    and not e.raw_text.startswith("/")))
+@manager_bot.on(events.NewMessage(func=lambda e: e.is_private and not e.document and (e.raw_text or "").strip() and not e.raw_text.startswith("/")))
 async def on_text(event):
     uid = event.sender_id
     if not is_admin(uid):
@@ -1920,18 +2006,17 @@ async def on_text(event):
     if kind == "addadmin":
         return await panel_to(chat, "admins", await do_addadmin(text))
 
+    # Deteksi otomatis jika admin paste Link Bot Lk21
+    if (kind == "bot" or kind == "play") and text.startswith("http") and ("t.me" in text or "telegram.me" in text) and "start=" in text:
+        return await process_bot_link(chat, text, uid)
+
     notice = await run_search(chat, kind, text, by_name(uid))
     if notice:
         await panel_to(chat, "main", notice)
 
-
-# ==========================================
-# TOMBOL (CALLBACK)
-# ==========================================
 ACTIONS = {"a:pause": act_pause, "a:resume": act_resume, "a:skip": act_skip,
            "a:stop": act_stop, "a:loop": act_loop, "a:filter": act_filter,
            "a:shuf": act_shuffle, "a:clr": act_clear}
-
 
 @manager_bot.on(events.CallbackQuery())
 async def on_callback(event):
@@ -1942,7 +2027,6 @@ async def on_callback(event):
     if data == "noop":
         return await event.answer()
 
-    # --- minta akses admin (boleh non-admin) ---
     if data == "req":
         if is_admin(uid):
             return await event.answer("Kamu sudah admin.", alert=True)
@@ -1968,7 +2052,6 @@ async def on_callback(event):
     if not is_admin(uid):
         return await event.answer("⛔ Kamu bukan admin.", alert=True)
 
-    # --- khusus owner: setujui / tolak / hapus admin ---
     if data.startswith(("appr:", "rej:", "deladm:")):
         if not is_owner(uid):
             return await event.answer("⛔ Khusus owner.", alert=True)
@@ -2005,7 +2088,6 @@ async def on_callback(event):
             await show(event, "admins")
         return
 
-    # --- input lewat tombol (cari, nonton, set VC, tambah admin) ---
     if data.startswith("i:"):
         kind = data[2:]
         if kind == "cancel":
@@ -2022,7 +2104,7 @@ async def on_callback(event):
                 pass
             WAIT[chat] = kind
             return await bring_panel(chat, "input")
-        if kind in ("play", "vplay", "fast"):
+        if kind in ("play", "vplay", "fast", "bot"):
             err = need_vc()
             if err:
                 return await event.answer(toast(err), alert=True)
@@ -2047,7 +2129,6 @@ async def on_callback(event):
             pass
         return await bring_panel(chat, "main")
 
-    # --- favorit / riwayat ---
     if data.startswith("l:"):
         parts = data.split(":")
         op, kind = parts[1], parts[2]
@@ -2078,9 +2159,10 @@ async def on_callback(event):
             return await show(event, kind)
         return await event.answer()
 
-    # --- simpan lagu / volume / timer tidur ---
     if data == "n:save":
         cur = current_songs.get(TARGET_VC_ID) if TARGET_VC_ID else None
+        if cur and cur.get("is_tg"):
+            return await event.answer("Video Telegram tidak bisa disimpan ke favorit.", alert=True)
         item = mk_item(cur) if cur and cur.get("title") != "Silent" else None
         if not item:
             return await event.answer("Tidak ada lagu yang bisa disimpan.", alert=True)
@@ -2093,7 +2175,6 @@ async def on_callback(event):
         await event.answer(toast(set_sleep(int(data[2:]))))
         return await show(event, "settings")
 
-    # --- hasil pencarian ---
     if data.startswith("pk:"):
         return await handle_pick(event, int(data[3:]))
     if data.startswith("pg:"):
@@ -2111,12 +2192,10 @@ async def on_callback(event):
         await event.answer("⏩ Langsung putar" if st["now"] else "➕ Masuk antrean")
         return await rerender_results(event, st, new_image=False)
 
-    # --- pindah tampilan ---
     if data.startswith("v:"):
         await event.answer()
         return await show(event, data[2:])
 
-    # --- aksi musik dan setelan ---
     if data in ACTIONS:
         text = await ACTIONS[data]()
         await event.answer(toast(text))
@@ -2131,7 +2210,6 @@ async def on_callback(event):
         await event.answer(toast(await act_remove(int(data[3:]))))
         return await show(event, "queue")
 
-    # --- VC (admin & owner) dan session (owner) ---
     if data == "a:unsetvc":
         await event.answer(toast(await do_unsetvc()))
         return await show(event, "vc")
@@ -2142,12 +2220,11 @@ async def on_callback(event):
         return await show(event, "vc")
     await event.answer()
 
-
-# ==========================================
-# UPLOAD SESSION (OWNER)
-# ==========================================
 @manager_bot.on(events.NewMessage(func=lambda e: e.is_private and e.document))
 async def on_document(event):
+    if is_video_msg(event.message):
+        return await on_video(event)
+        
     if event.sender_id != OWNER_ID:
         return
     name = ""
@@ -2155,7 +2232,7 @@ async def on_document(event):
         if hasattr(a, "file_name"):
             name = a.file_name or ""
     if not name.lower().endswith(".zip"):
-        return await event.reply("❌ Kirim file <code>.zip</code> yang berisi file <code>.session</code>.")
+        return 
 
     msg = await event.reply("⏳ <i>Memproses file…</i>")
     zip_path = await event.download_media()
@@ -2190,10 +2267,6 @@ async def on_document(event):
     except Exception as e:
         await msg.edit(f"❌ <b>Gagal</b>\n<code>{esc(cut(e, 300))}</code>")
 
-
-# ==========================================
-# JALANKAN
-# ==========================================
 BOT_COMMANDS = [
     ("start", "Buka panel"), ("play", "Cari & putar lagu / playlist"), ("fast", "Putar hasil teratas"),
     ("vplay", "Nonton (share screen)"), ("np", "Sedang diputar"), ("queue", "Lihat antrean"),
@@ -2209,7 +2282,6 @@ BOT_COMMANDS = [
     ("getsession", "Owner: ambil SESSION_STRING"),
 ]
 
-
 async def register_commands():
     try:
         await manager_bot(SetBotCommandsRequest(
@@ -2218,15 +2290,15 @@ async def register_commands():
     except Exception as e:
         print(f"Gagal pasang menu perintah: {e}")
 
-
 async def notify_owner(text):
     try:
         await bring_panel(OWNER_ID, "main", text)
     except Exception as e:
         print(f"Gagal kirim notifikasi ke owner: {e}")
 
-
 async def main():
+    shutil.rmtree(FILM_DIR, ignore_errors=True)
+    os.makedirs(FILM_DIR, exist_ok=True)
     print("Memulai Manager Bot...")
     await manager_bot.start(bot_token=BOT_TOKEN)
     print("✅ Manager Bot siap!")
@@ -2243,7 +2315,6 @@ async def main():
     else:
         await notify_owner("🤖 <b>Bot nyala.</b> Kirim file zip session untuk menyalakan userbot.")
     await manager_bot.run_until_disconnected()
-
 
 if __name__ == "__main__":
     try:
