@@ -1,13 +1,13 @@
 name: Run Telegram Music Bot
 
 on:
-  workflow_dispatch:
+  workflow_dispatch:        # bisa dijalankan manual
   schedule:
-    - cron: '0 */6 * * *'
+    - cron: '0 */6 * * *'   # nyala ulang tiap 6 jam
 
 concurrency:
   group: music-bot
-  cancel-in-progress: false
+  cancel-in-progress: false # jangan sampai dua bot jalan bersamaan
 
 permissions:
   contents: read
@@ -15,7 +15,7 @@ permissions:
 jobs:
   run-bot:
     runs-on: ubuntu-latest
-    timeout-minutes: 355
+    timeout-minutes: 355    # batas GitHub 6 jam
 
     steps:
     - name: Checkout Code
@@ -39,7 +39,7 @@ jobs:
         python -m pip install --upgrade pip
         pip install -r requirements.txt
 
-    - name: Write cookies
+    - name: Write cookies (opsional, dari Secret YT_COOKIES)
       env:
         YT_COOKIES: ${{ secrets.YT_COOKIES }}
       run: |
