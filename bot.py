@@ -1977,7 +1977,7 @@ def cmd(pattern, owner=False):
                 return await event.reply("⛔ Perintah ini khusus owner.")
             await deny(event)
 
-        manager_bot.on(events.NewMessage(pattern=pattern, func=lambda e: e.is_private))(wrapper)
+        manager_bot.on(events.NewMessage(pattern=pattern, incoming=True, func=lambda e: e.is_private))(wrapper)
         return wrapper
     return deco
 
@@ -2169,7 +2169,7 @@ async def c_amode(event):
 # ==========================================
 # HANDLER VIDEO & TEKS
 # ==========================================
-@manager_bot.on(events.NewMessage(func=lambda e: e.is_private and not e.document and (e.raw_text or "").strip() and not e.raw_text.startswith("/")))
+@manager_bot.on(events.NewMessage(incoming=True, func=lambda e: e.is_private and not e.document and (e.raw_text or "").strip() and not e.raw_text.startswith("/")))
 async def on_text(event):
     uid = event.sender_id
     if not is_admin(uid):
@@ -2400,7 +2400,7 @@ async def on_callback(event):
         return await show(event, "vc")
     await event.answer()
 
-@manager_bot.on(events.NewMessage(func=lambda e: e.is_private and e.document))
+@manager_bot.on(events.NewMessage(incoming=True, func=lambda e: e.is_private and e.document))
 async def on_document(event):
     if is_video_msg(event.message):
         return await on_video(event)
